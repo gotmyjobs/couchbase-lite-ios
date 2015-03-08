@@ -91,8 +91,6 @@ static ValueConverter arrayValueConverter(ValueConverter itemConverter) {
         value = converter(rawValue, self, property);
         if (value)
             [self cacheValue: value ofProperty: property changed: NO];
-        else if (rawValue)
-            Warn(@"Unable to decode property %@ of %@", property, _document);
     }
     return value;
 }
