@@ -12,6 +12,9 @@
        CBLDatabaseChange, CBL_Shared, CBLModelFactory;
 
 
+// Default value for maxRevTreeDepth, the max rev depth to preserve in a prune operation
+#define kDefaultMaxRevs 20
+
 /** NSNotification posted when one or more documents have been updated.
     The userInfo key "changes" contains an array of CBLDatabaseChange objects. */
 extern NSString* const CBL_DatabaseChangesNotification;
@@ -100,17 +103,15 @@ extern NSArray* CBL_RunloopModes;
 
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
                          revisionID: (NSString*)revID
-                            options: (CBLContentOptions)options
+                           withBody: (BOOL)withBody
                              status: (CBLStatus*)outStatus;
 #if DEBUG // convenience method for tests
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
                          revisionID: (NSString*)revID;
 #endif
 
-- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev
-                       options: (CBLContentOptions)options;
+- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev;
 - (CBL_Revision*) revisionByLoadingBody: (CBL_Revision*)rev
-                                options: (CBLContentOptions)options
                                  status: (CBLStatus*)outStatus;
 - (SequenceNumber) getRevisionSequence: (CBL_Revision*)rev;
 
@@ -148,18 +149,5 @@ extern NSArray* CBL_RunloopModes;
 /** Post an NSNotification. handles if the database is running on a separate dispatch_thread
  (issue #364). */
 - (void) postNotification: (NSNotification*)notification;
-
-/** Create a local checkpoint document. This method is called only when importing or
-    replacing the database. The local checkpoint contains the old localUUID of the database 
-    before importing. The old localUUID is used by replicators to get the local checkpoint 
-    from the imported database in order to start replicating from from the current local 
-    checkpoint of the imported database after importing. */
-- (BOOL) createLocalCheckpointDocument: (NSError**)outError;
-
-/** Returns local checkpoint document if it exists. Otherwise returns nil. */
-- (NSDictionary*) getLocalCheckpointDocument;
-
-// Local checkpoint document keys:
-#define kCBLDatabaseLocalCheckpoint_LocalUUID @"localUUID"
 
 @end

@@ -39,7 +39,7 @@
 
 
 // Length that constitutes a 'big' attachment
-#define kBigAttachmentLength (16*1024)
+#define kBigAttachmentLength (2*1024)
 
 
 @implementation CBLDatabase (Attachments)
@@ -146,7 +146,7 @@
     CBL_MutableRevision* mrev = [[CBL_MutableRevision alloc] initWithDocID: docID
                                                                      revID: revID
                                                                    deleted: NO];
-    *outStatus = [self loadRevisionBody: mrev options: 0];
+    *outStatus = [self loadRevisionBody: mrev];
     if (CBLStatusIsError(*outStatus))
         return nil;
     return mrev.attachments;
@@ -199,76 +199,60 @@
 #pragma mark - UPDATING _attachments DICTS:
 
 
-// Replaces attachment data whose revpos is < minRevPos with stubs.
-// If attachmentsFollow==YES, replaces data with "follows" key.
-+ (void) stubOutAttachmentsIn: (CBL_MutableRevision*)rev
-                 beforeRevPos: (int)minRevPos
-            attachmentsFollow: (BOOL)attachmentsFollow
-{
-    if (minRevPos <= 1 && !attachmentsFollow)
-        return;
-    [rev mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
-        int revPos = [attachment[@"revpos"] intValue];
-        bool includeAttachment = (revPos == 0 || revPos >= minRevPos);
-        bool stubItOut = !includeAttachment && !attachment[@"stub"];
-        bool addFollows = includeAttachment && attachmentsFollow
-                                            && !attachment[@"follows"];
-        if (!stubItOut && !addFollows)
-            return attachment;  // no change
-        // Need to modify attachment entry:
-        NSMutableDictionary* editedAttachment = [attachment mutableCopy];
-        [editedAttachment removeObjectForKey: @"data"];
-        if (stubItOut) {
-            // ...then remove the 'data' and 'follows' key:
-            [editedAttachment removeObjectForKey: @"follows"];
-            editedAttachment[@"stub"] = $true;
-            LogTo(SyncVerbose, @"Stubbed out attachment %@/'%@': revpos %d < %d",
-                  rev, name, revPos, minRevPos);
-        } else if (addFollows) {
-            [editedAttachment removeObjectForKey: @"stub"];
-            editedAttachment[@"follows"] = $true;
-            LogTo(SyncVerbose, @"Added 'follows' for attachment %@/'%@': revpos %d >= %d",
-                  rev, name, revPos, minRevPos);
-        }
-        return editedAttachment;
-    }];
+static UInt64 smallestLength(NSDictionary* attachment) {
+    UInt64 length = [attachment[@"length"] unsignedLongLongValue];
+    NSNumber* encodedLength = attachment[@"encoded_length"];
+    if (encodedLength)
+        length = encodedLength.unsignedLongLongValue;
+    return length;
 }
 
 
 - (BOOL) expandAttachmentsIn: (CBL_MutableRevision*)rev
-                     options: (CBLContentOptions)options
+                   minRevPos: (int)minRevPos
+                allowFollows: (BOOL)allowFollows
+                      decode: (BOOL)decodeAttachments
                       status: (CBLStatus*)outStatus
 {
     *outStatus = kCBLStatusOK;
-    BOOL decodeAttachments = !(options & kCBLLeaveAttachmentsEncoded);
     [rev mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *attachment) {
-        BOOL decodeIt = decodeAttachments && (attachment[@"encoding"] != nil);
-        if (decodeIt || attachment[@"stub"] || attachment[@"follows"]) {
-            // Attachment content needs to be loaded from storage, or decoded, or both:
+        int revPos = [attachment[@"revpos"] intValue];
+        if (revPos < minRevPos && revPos != 0) {
+            // Stub:
+            return @{@"stub": @YES, @"revpos": @(revPos)};
+        } else {
             NSMutableDictionary* expanded = [attachment mutableCopy];
             [expanded removeObjectForKey: @"stub"];
-            [expanded removeObjectForKey: @"follows"];
-            if (decodeIt) {
+            if (decodeAttachments) {
                 [expanded removeObjectForKey: @"encoding"];
                 [expanded removeObjectForKey: @"encoded_length"];
             }
 
-            CBL_Attachment* attachObj = [self attachmentForDict: attachment named: name
-                                                         status: outStatus];
-            if (!attachObj) {
-                Warn(@"Can't get attachment '%@' of %@ (status %d)", name, rev, *outStatus);
-                return attachment;
-            }
-            NSData* data = decodeIt ? attachObj.content : attachObj.encodedContent;
-            if (data) {
-                expanded[@"data"] = [CBLBase64 encode: data];
-                attachment = expanded;
+            if (allowFollows && smallestLength(expanded) >= kBigAttachmentLength) {
+                // Data will follow (multipart):
+                expanded[@"follows"] = @YES;
+                [expanded removeObjectForKey: @"data"];
             } else {
-                Warn(@"Can't get binary data of attachment '%@' of %@", name, rev);
-                *outStatus = kCBLStatusNotFound;
+                // Put data inline:
+                [expanded removeObjectForKey: @"follows"];
+                CBLStatus status;
+                CBL_Attachment* attachObj = [self attachmentForDict: attachment named: name
+                                                             status: &status];
+                if (!attachObj) {
+                    Warn(@"Can't get attachment '%@' of %@ (status %d)", name, rev, status);
+                    *outStatus = status;
+                    return attachment;
+                }
+                NSData* data = decodeAttachments ? attachObj.content : attachObj.encodedContent;
+                if (!data) {
+                    Warn(@"Can't get binary data of attachment '%@' of %@", name, rev);
+                    *outStatus = kCBLStatusNotFound;
+                    return attachment;
+                }
+                expanded[@"data"] = [CBLBase64 encode: data];
             }
+            return expanded;
         }
-        return attachment;
     }];
     return (*outStatus == kCBLStatusOK);
 }
@@ -400,10 +384,10 @@
                                                                      deleted: NO];
     if (oldRevID) {
         // Load existing revision if this is a replacement:
-        *outStatus = [self loadRevisionBody: oldRev options: 0];
+        *outStatus = [self loadRevisionBody: oldRev];
         if (CBLStatusIsError(*outStatus)) {
             if (*outStatus == kCBLStatusNotFound
-                    && [self getDocumentWithID: docID revisionID: nil options: kCBLNoBody
+                && [self getDocumentWithID: docID revisionID: nil withBody: NO
                                         status: outStatus] != nil) {
                 *outStatus = kCBLStatusConflict;   // if some other revision exists, it's a conflict
             }

@@ -23,6 +23,7 @@
 #import "CBL_Server.h"
 #import "CBLPersonaAuthorizer.h"
 #import "CBLFacebookAuthorizer.h"
+#import "CBLCookieStorage.h"
 #import "MYBlockUtils.h"
 #import "MYURLUtils.h"
 
@@ -47,6 +48,7 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     NSSet* _pendingDocIDs;
     bool _started;
     CBL_Replicator* _bg_replicator;       // ONLY used on the server thread
+    NSMutableArray* _pendingCookies;        
 }
 
 
@@ -209,17 +211,24 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
         Warn(@"%@: Could not create cookie from parameters", self);
         return;
     }
-    [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookie: cookie];
+
+    if (_bg_replicator)
+        [_bg_replicator.cookieStorage setCookie: cookie];
+    else {
+        if (!_pendingCookies)
+            _pendingCookies = [NSMutableArray array];
+        [_pendingCookies addObject: cookie];
+    }
 }
 
 
 -(void) deleteCookieNamed: (NSString*)name {
-    NSArray* cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL: _remoteURL];
-    for (NSHTTPCookie* cookie in cookies) {
-        if ([cookie.name isEqualToString: name]) {
-            [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie: cookie];
-            return;
-        }
+    if (_bg_replicator)
+        [_bg_replicator.cookieStorage deleteCookiesNamed: name];
+    else {
+        if (!_pendingCookies)
+            _pendingCookies = [NSMutableArray array];
+        [_pendingCookies addObject: name];
     }
 }
 
@@ -292,10 +301,14 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 
 
 - (void) stop {
-    [self tellReplicator: ^(CBL_Replicator* bgReplicator) {
+    [self tellReplicatorAndWait:^id(CBL_Replicator * bgReplicator) {
         // This runs on the server thread:
         [bgReplicator stop];
+        [[NSNotificationCenter defaultCenter] removeObserver: self name: nil
+                                                      object: _bg_replicator];
+        return @(YES);
     }];
+
     _started = NO;
     [_database forgetReplication: self];
 }
@@ -367,10 +380,12 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     cfSetObj(&_serverCertificate, serverCert);
 
     if (changed) {
+#ifndef MY_DISABLE_LOGGING
         static const char* kStatusNames[] = {"stopped", "offline", "idle", "active"};
         LogTo(Sync, @"%@: %s, progress = %u / %u, err: %@",
               self, kStatusNames[status], (unsigned)changesProcessed, (unsigned)changesTotal,
               error.localizedDescription);
+#endif
         [[NSNotificationCenter defaultCenter]
                         postNotificationName: kCBLReplicationChangeNotification object: self];
     }
@@ -438,15 +453,27 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     CBLStatus status;
     CBL_Replicator* repl = [server_dbmgr replicatorWithProperties: properties status: &status];
     if (!repl) {
+        __weak CBLReplication *weakSelf = self;
         [_database doAsync: ^{
-            [self updateStatus: kCBLReplicationStopped
-                         error: CBLStatusToNSError(status, nil)
-                     processed: 0 ofTotal: 0 serverCert: NULL];
+            CBLReplication *strongSelf = weakSelf;
+            [strongSelf updateStatus: kCBLReplicationStopped
+                               error: CBLStatusToNSError(status, nil)
+                           processed: 0 ofTotal: 0 serverCert: NULL];
         }];
         return;
     }
     if (auth)
         repl.authorizer = auth;
+
+    if ([_pendingCookies count] > 0) {
+        for (id cookie in _pendingCookies) {
+            if ([cookie isKindOfClass: [NSHTTPCookie class]])
+                [repl.cookieStorage setCookie: cookie];
+            else if ([cookie isKindOfClass: [NSString class]])
+                [repl.cookieStorage deleteCookiesNamed: cookie];
+        }
+        _pendingCookies = nil;
+    }
 
     CBLPropertiesTransformationBlock xformer = self.propertiesTransformationBlock;
     if (xformer) {
@@ -474,10 +501,12 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 
 
 // CAREFUL: This is called on the server's background thread!
-- (void) bg_replicationProgressChanged: (NSNotification*)n
-{
-    AssertEq(n.object, _bg_replicator);
-    [self bg_updateProgress];
+- (void) bg_replicationProgressChanged: (NSNotification*)n {
+    if (n.object == _bg_replicator)
+        [self bg_updateProgress];
+    else
+        Warn(@"%@: Received replication change notification from "
+             "an unexpected replicator %@ (expected %@)", self, n.object, _bg_replicator);
 }
 
 
@@ -497,15 +526,18 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     NSUInteger total = _bg_replicator.changesTotal;
     SecCertificateRef serverCert = _bg_replicator.serverCert;
     cfretain(serverCert);
-    [_database doAsync: ^{
-        [self updateStatus: status error: error processed: changes ofTotal: total
-                serverCert: serverCert];
-        cfrelease(serverCert);
-    }];
-    
+
     if (status == kCBLReplicationStopped) {
         [self bg_setReplicator: nil];
     }
+
+    __weak CBLReplication *weakSelf = self;
+    [_database doAsync: ^{
+        CBLReplication *strongSelf = weakSelf;
+        [strongSelf updateStatus: status error: error processed: changes ofTotal: total
+                          serverCert: serverCert];
+        cfrelease(serverCert);
+    }];
 }
 
 

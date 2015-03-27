@@ -25,6 +25,7 @@
 #import "CBLBatcher.h"
 #import "CBLMultipartDownloader.h"
 #import "CBLBulkDownloader.h"
+#import "CBLCookieStorage.h"
 #import "CBLSequenceMap.h"
 #import "CBLInternal.h"
 #import "CBLMisc.h"
@@ -119,6 +120,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     _changeTracker.filterParameters = _filterParameters;
     _changeTracker.docIDs = _docIDs;
     _changeTracker.authorizer = _authorizer;
+    _changeTracker.cookieStorage = _cookieStorage;
     _changeTracker.usePOST = [self serverIsSyncGatewayVersion: @"0.93"];
 
     unsigned heartbeat = $castIf(NSNumber, _options[kCBLReplicatorOption_Heartbeat]).unsignedIntValue;
@@ -505,6 +507,13 @@ static NSString* joinQuotedEscaped(NSArray* strings);
           ^(CBLBulkDownloader* result, NSError *error) {
               // The entire _bulk_get is finished:
               __strong CBL_Puller *strongSelf = weakSelf;
+
+              // Remove the remote request first to prevent the request from cancellation
+              // when setting the error (a permanent error). If that happens, this block
+              // will be called a second time upon calling cancelling request and result to
+              // a romdom crash and over-decreasing the _asyncTaskCount (#613):
+              [strongSelf removeRemoteRequest:dl];
+
               if (error) {
                   strongSelf.error = error;
                   [strongSelf revisionFailed];
@@ -515,7 +524,6 @@ static NSString* joinQuotedEscaped(NSArray* strings);
               strongSelf.changesProcessed += remainingRevs.count;
               
               // Note that we've finished this task:
-              [strongSelf removeRemoteRequest:dl];
               [strongSelf asyncTasksFinished:1];
               
               --_httpConnectionCount;

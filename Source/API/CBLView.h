@@ -38,8 +38,8 @@ typedef void (^CBLMapBlock)(NSDictionary* doc, CBLMapEmitBlock emit);
 	@param values  A parallel array of values to be reduced, corresponding 1::1 with the keys.
 	@param rereduce  YES if the input values are the results of previous reductions.
 	@return  The reduced value; almost always a scalar or small fixed-size object. */
-typedef __nonnull id (^CBLReduceBlock)(__nonnull NSArray* keys,
-                                       __nonnull NSArray* values,
+typedef __nonnull id (^CBLReduceBlock)(NSArray* __nonnull keys,
+                                       NSArray* __nonnull values,
                                        BOOL rereduce);
 
 
@@ -92,6 +92,12 @@ FOUNDATION_EXTERN id CBLTextKey(NSString* text);
     See -setMapBlock:reduceBlock:version: for more details. */
 - (BOOL) setMapBlock: (CBLMapBlock)mapBlock
              version: (NSString*)version;
+
+/** If this property is set, only documents whose "type" property is equal to its value will be
+    passed to the map block and indexed. This can speed up indexing.
+    Just like the map block, this property is not persistent; it needs to be set at runtime before
+    the view is queried. And if its value changes, the view's version also needs to change. */
+@property (copy) NSString* documentType;
 
 /** Is the view's index currently out of date? */
 @property (readonly) BOOL stale;

@@ -35,6 +35,7 @@
     CBLViewCollation _collation;
     NSString* _mapTableName;
     BOOL _initializedFullTextSchema, _initializedRTreeSchema;
+    NSString* _emitSQL;
 }
 
 @synthesize name=_name, delegate=_delegate;
@@ -114,12 +115,19 @@
             value TEXT,\
             fulltext_id INTEGER, \
             bbox_id INTEGER, \
-            geokey BLOB);\
+            geokey BLOB)";
+    NSError* error;
+    if (![self runStatements: sql error: &error])
+        Warn(@"Couldn't create view index `%@`: %@", _name, error);
+}
+
+- (void) finishCreatingIndex {
+    NSString* sql = @"\
         CREATE INDEX IF NOT EXISTS 'maps_#_keys' on 'maps_#'(key COLLATE JSON);\
         CREATE INDEX IF NOT EXISTS 'maps_#_sequence' ON 'maps_#'(sequence)";
     NSError* error;
     if (![self runStatements: sql error: &error])
-        Warn(@"Couldn't create view index `%@`: %@", _name, error);
+        Warn(@"Couldn't create view SQL index `%@`: %@", _name, error);
 }
 
 
@@ -128,7 +136,7 @@
         return;
     NSString* sql = @"\
         DROP TABLE IF EXISTS 'maps_#';\
-        UPDATE views SET total_docs=0 WHERE view_id=#";
+        UPDATE views SET lastSequence=0, total_docs=0 WHERE view_id=#";
     NSError* error;
     if (![self runStatements: sql error: &error])
         Warn(@"Couldn't delete view index `%@`: %@", _name, error);
@@ -259,11 +267,15 @@
         SequenceNumber viewLastSequence[inputViews.count];
         unsigned deletedCount = 0;
         int i = 0;
+        NSMutableSet* docTypes = [NSMutableSet set];
+        NSMutableDictionary* viewDocTypes = nil;
+        BOOL allDocTypes = NO;
         NSMutableDictionary* viewTotalRows = [[NSMutableDictionary alloc] init];
         NSMutableArray* views = [[NSMutableArray alloc] initWithCapacity: inputViews.count];
         NSMutableArray* mapBlocks = [[NSMutableArray alloc] initWithCapacity: inputViews.count];
         for (CBL_SQLiteViewStorage* view in inputViews) {
-            CBLMapBlock mapBlock = view.delegate.mapBlock;
+            id<CBL_ViewStorageDelegate> delegate = view.delegate;
+            CBLMapBlock mapBlock = delegate.mapBlock;
             if (mapBlock == NULL) {
                 Assert(view != self,
                        @"Cannot index view %@: no map block registered",
@@ -290,16 +302,28 @@
                     [view createIndex];
                 minLastSequence = MIN(minLastSequence, last);
                 LogTo(ViewVerbose, @"    %@ last indexed at #%lld", view.name, last);
+
+                NSString* docType = delegate.documentType;
+                if (docType) {
+                    [docTypes addObject: docType];
+                    if (!viewDocTypes)
+                        viewDocTypes = [NSMutableDictionary dictionary];
+                    viewDocTypes[view.name] = docType;
+                } else {
+                    allDocTypes = YES; // can't filter by doc_type
+                }
+
                 BOOL ok;
                 if (last == 0) {
                     // If the lastSequence has been reset to 0, make sure to remove all map results:
                     ok = [fmdb executeUpdate: [view queryString: @"DELETE FROM 'maps_#'"]];
                 } else {
+                    [dbStorage optimizeSQLIndexes]; // ensures query will use the right indexes
                     // Delete all obsolete map results (ones from since-replaced revisions):
                     ok = [fmdb executeUpdate:
                           [view queryString: @"DELETE FROM 'maps_#' WHERE sequence IN ("
                                                 "SELECT parent FROM revs WHERE sequence>? "
-                                                    "AND parent>0 AND parent<=?)"],
+                                                    "AND +parent>0 AND +parent<=?)"],
                           @(last), @(last)];
                 }
                 if (!ok)
@@ -324,7 +348,7 @@
         // This is the emit() block, which gets called from within the user-defined map() block
         // that's called down below.
         __block CBL_SQLiteViewStorage* curView;
-        __block NSDictionary* curDoc;
+        __block NSMutableDictionary* curDoc;
         __block SequenceNumber sequence = minLastSequence;
         __block CBLStatus emitStatus = kCBLStatusOK;
         __block unsigned insertedCount = 0;
@@ -342,11 +366,15 @@
         };
 
         // Now scan every revision added since the last time the views were indexed:
-        NSMutableString* sql = [@"SELECT revs.doc_id, sequence, docid, revid, json, "
-                                "no_attachments, deleted FROM revs, docs "
-                                "WHERE sequence>? AND current!=0 " mutableCopy];
+        BOOL checkDocTypes = docTypes.count > 1 || (allDocTypes && docTypes.count > 0);
+        NSMutableString* sql = [@"SELECT revs.doc_id, sequence, docid, revid, json, deleted " mutableCopy];
+        if (checkDocTypes)
+            [sql appendString: @", doc_type "];
+        [sql appendString: @"FROM revs, docs WHERE sequence>? AND current!=0 "];
         if (minLastSequence == 0)
             [sql appendString: @"AND deleted=0 "];
+        if (!allDocTypes && docTypes.count > 0)
+            [sql appendFormat: @"AND doc_type IN (%@) ", CBLJoinSQLQuotedStrings(docTypes.allObjects)];
         [sql appendString: @"AND revs.doc_id = docs.doc_id "
                             "ORDER BY revs.doc_id, deleted, revid DESC"];
         CBL_FMResultSet* r = [fmdb executeQuery: sql, @(minLastSequence)];
@@ -366,8 +394,8 @@
                 }
                 NSString* revID = [r stringForColumnIndex: 3];
                 NSData* json = [r dataForColumnIndex: 4];
-                BOOL noAttachments = [r boolForColumnIndex: 5];
-                BOOL deleted = [r boolForColumnIndex: 6];
+                BOOL deleted = [r boolForColumnIndex: 5];
+                NSString* docType = checkDocTypes ? [r stringForColumnIndex: 6] : nil;
 
                 // Skip rows with the same doc_id -- these are losing conflicts.
                 while ((keepGoing = [r next]) && [r longLongIntForColumnIndex: 0] == doc_id) {
@@ -416,23 +444,26 @@
                     continue;
 
                 // Get the document properties, to pass to the map function:
-                CBLContentOptions contentOptions = kCBLIncludeLocalSeq;
-                if (noAttachments)
-                    contentOptions |= kCBLNoAttachments;
                 curDoc = [dbStorage documentPropertiesFromJSON: json
                                                     docID: docID revID:revID
                                                   deleted: NO
-                                                 sequence: sequence
-                                                  options: contentOptions];
+                                                 sequence: sequence];
                 if (!curDoc) {
                     Warn(@"Failed to parse JSON of doc %@ rev %@", docID, revID);
                     continue;
                 }
-                
+                curDoc[@"_local_seq"] = @(sequence);
+
                 // Call the user-defined map() to emit new key/value pairs from this revision:
-                int i = 0;
+                int i = -1;
                 for (curView in views) {
+                    ++i;
                     if (viewLastSequence[i] < realSequence) {
+                        if (checkDocTypes) {
+                            NSString* viewDocType = viewDocTypes[curView.name];
+                            if (viewDocType && ![viewDocType isEqual: docType])
+                                continue; // skip; view's documentType doesn't match this doc
+                        }
                         LogTo(ViewVerbose, @"#%lld: map \"%@\" for view %@...",
                               sequence, docID, curView.name);
                         @try {
@@ -446,7 +477,6 @@
                             return emitStatus;
                         }
                     }
-                    ++i;
                 }
                 curView = nil;
             }
@@ -455,6 +485,7 @@
         
         // Finally, record the last revision sequence number that was indexed and update #rows:
         for (CBL_SQLiteViewStorage* view in views) {
+            [view finishCreatingIndex];
             int newTotalRows = [viewTotalRows[@(view.viewID)] intValue];
             Assert(newTotalRows >= 0);
             if (![fmdb executeUpdate: @"UPDATE views SET lastSequence=?, total_docs=? WHERE view_id=?",
@@ -520,11 +551,13 @@
     if (!keyJSON)
         keyJSON = [[NSData alloc] initWithBytes: "null" length: 4];
 
+    if (!_emitSQL)
+        _emitSQL = [self queryString: @"INSERT INTO 'maps_#' (sequence, key, value, "
+                                       "fulltext_id, bbox_id, geokey) VALUES (?, ?, ?, ?, ?, ?)"];
+
     fmdb.bindNSDataAsString = YES;
-    BOOL ok = [fmdb executeUpdate: [self queryString: @"INSERT INTO 'maps_#' (sequence, key, value, "
-                                   "fulltext_id, bbox_id, geokey) VALUES (?, ?, ?, ?, ?, ?)"],
-                                  @(sequence), keyJSON, valueJSON,
-               fullTextID, bboxID, geoKey];
+    BOOL ok = [fmdb executeUpdate: _emitSQL, @(sequence), keyJSON, valueJSON,
+                                             fullTextID, bboxID, geoKey];
     fmdb.bindNSDataAsString = NO;
     return ok ? kCBLStatusOK : dbStorage.lastDbError;
 }
@@ -717,7 +750,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                 CBLStatus linkedStatus;
                 CBL_Revision* linked = [db getDocumentWithID: linkedID
                                                   revisionID: linkedRev
-                                                     options: options->content
+                                                     withBody: YES
                                                       status: &linkedStatus];
                 docContents = linked ? linked.properties : $null;
                 sequence = linked.sequence;
@@ -726,8 +759,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                                        docID: docID
                                                        revID: [r stringForColumnIndex: 4]
                                                      deleted: NO
-                                                    sequence: sequence
-                                                     options: options->content];
+                                                    sequence: sequence];
             }
         }
         LogTo(ViewVerbose, @"Query %@: Found row with key=%@, value=%@, id=%@",
@@ -834,10 +866,11 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
             NSString* docID = [r stringForColumnIndex: 0];
             SequenceNumber sequence = [r longLongIntForColumnIndex: 1];
             UInt64 fulltextID = [r longLongIntForColumnIndex: 2];
-//            NSData* valueData = [r dataForColumnIndex: 3];
+            NSData* valueData = [r dataForColumnIndex: 3];
             CBLFullTextQueryRow* row = [[CBLFullTextQueryRow alloc] initWithDocID: docID
                                                                          sequence: sequence
                                                                        fullTextID: fulltextID
+                                                                            value: valueData
                                                                           storage: self];
             // Parse the offsets as a space-delimited list of numbers, into an NSArray.
             // (See http://sqlite.org/fts3.html#section_4_1 )
@@ -883,6 +916,7 @@ static id keyForPrefixMatch(id key, unsigned depth) {
 }
 
 
+#ifndef MY_DISABLE_LOGGING
 static inline NSString* toJSONString( id object ) {
     if (!object)
         return nil;
@@ -890,6 +924,7 @@ static inline NSString* toJSONString( id object ) {
                                  options: CBLJSONWritingAllowFragments
                                    error: NULL];
 }
+#endif
 
 static inline NSData* toJSONData( id object ) {
     if (!object)

@@ -58,6 +58,7 @@ NSString* CBLVersion( void ) {
         return $sprintf(@"%s (unofficial)", CBL_VERSION_STRING);
 }
 
+#ifndef MY_DISABLE_LOGGING
 static NSString* CBLFullVersionInfo( void ) {
     NSMutableString* vers = [NSMutableString stringWithFormat: @"Couchbase Lite %@", CBLVersion()];
 #ifdef CBL_SOURCE_REVISION
@@ -66,6 +67,7 @@ static NSString* CBLFullVersionInfo( void ) {
 #endif
     return vers;
 }
+#endif
 
 
 @interface CBLManager ()
@@ -107,13 +109,19 @@ static NSCharacterSet* kIllegalNameChars;
 
 
 + (void) enableLogging: (NSString*)type {
+#ifdef MY_DISABLE_LOGGING
+    NSLog(@"Can't enable logging: Couchbase Lite was compiled with logging disabled");
+#else
     EnableLog(YES);
     if (type != nil)
         _EnableLogTo(type, YES);
+#endif
 }
 
 + (void) redirectLogging: (void (^)(NSString* type, NSString* message))callback {
+#ifndef MY_DISABLE_LOGGING
     MYLoggingCallback = callback;
+#endif
 }
 
 
@@ -526,7 +534,7 @@ static CBLManager* sInstance;
     return CBLRemoveFileIfExists(db.dir, outError) &&
             [fmgr copyItemAtPath: databaseDir toPath: db.dir error: outError] &&
             [db open: outError] &&
-            [db createLocalCheckpointDocument: outError] &&
+            [db saveLocalUUIDInLocalCheckpointDocument: outError] &&
             [db replaceUUIDs: outError];
 }
 

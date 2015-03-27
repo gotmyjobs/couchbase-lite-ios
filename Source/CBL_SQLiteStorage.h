@@ -16,14 +16,15 @@
 @property (readonly, nonatomic) CBLStatus lastDbStatus;
 @property (readonly, nonatomic) CBLStatus lastDbError;
 
+- (void) optimizeSQLIndexes;
+
 - (BOOL) runStatements: (NSString*)statements error: (NSError**)outError;
 
-- (NSDictionary*) documentPropertiesFromJSON: (NSData*)json
-                                       docID: (NSString*)docID
-                                       revID: (NSString*)revID
-                                     deleted: (BOOL)deleted
-                                    sequence: (SequenceNumber)sequence
-                                     options: (CBLContentOptions)options;
+- (NSMutableDictionary*) documentPropertiesFromJSON: (NSData*)json
+                                              docID: (NSString*)docID
+                                              revID: (NSString*)revID
+                                            deleted: (BOOL)deleted
+                                           sequence: (SequenceNumber)sequence;
 
 /** Loads revision given its sequence. Assumes the given docID is valid. */
 - (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
@@ -31,6 +32,11 @@
                                     status: (CBLStatus*)outStatus;
 
 @end
+
+
+/** Wraps each string in single-quotes (escaping single quotes by doubling them)
+    and separates the strings with commas. */
+NSString* CBLJoinSQLQuotedStrings(NSArray* strings);
 
 
 #if DEBUG

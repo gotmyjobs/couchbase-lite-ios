@@ -825,7 +825,7 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
                                                              {@"deleted", $true})}) ]));
     // Get conflicts:
     options = [CBLQueryOptions new];
-    options->allDocsMode = kCBLIncludeConflicts;
+    options->allDocsMode = kCBLShowConflicts;
     query = [db getAllDocs: options status: &status];
     NSString* curRevID = [docs[1] revID];
     NSDictionary* expectedConflict1 = $dict({@"id",  @"44444"},
@@ -1174,6 +1174,7 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     CBLFullTextQueryRow* row = rows[0];
     AssertEqual(row.documentID, @"33333");
     AssertEqual(row.fullText, @"a dog whøse ñame was “Dog”");
+    AssertEqual(row.value, @"33333");
     Assert(row.matchCount >= 2u);
     if (row.matchCount >= 2u) {
         Assert(NSEqualRanges([row textRangeOfMatch: 0], NSMakeRange(2, 3)));  // first "dog"

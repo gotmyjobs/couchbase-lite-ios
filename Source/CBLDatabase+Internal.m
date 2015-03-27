@@ -41,15 +41,15 @@ NSString* const CBL_DatabaseWillBeDeletedNotification = @"CBL_DatabaseWillBeDele
 NSString* const CBL_PrivateRunloopMode = @"CouchbaseLitePrivate";
 NSArray* CBL_RunloopModes;
 
-const CBLChangesOptions kDefaultCBLChangesOptions = {UINT_MAX, 0, NO, NO, YES};
+const CBLChangesOptions kDefaultCBLChangesOptions = {UINT_MAX, NO, NO, YES};
+
+// When this many changes pile up in _changesToNotify, start removing their bodies to save RAM
+#define kManyChangesToNotify 5000
 
 static BOOL sAutoCompact = YES;
 
 
 @implementation CBLDatabase (Internal)
-
-#define kLocalCheckpointDocId @"CBL_LocalCheckpoint"
-
 
 + (void) initialize {
     if (self == [CBLDatabase class]) {
@@ -185,6 +185,8 @@ static BOOL sAutoCompact = YES;
         [_storage setInfo: CBLCreateUUID() forKey: @"publicUUID"];
     }
 
+    _storage.maxRevTreeDepth = [[_storage infoForKey: @"max_revs"] intValue] ?: kDefaultMaxRevs;
+
     // Open attachment store:
     NSString* attachmentsPath = self.attachmentStorePath;
     _attachments = [[CBL_BlobStore alloc] initWithPath: attachmentsPath error: outError];
@@ -287,6 +289,16 @@ static BOOL sAutoCompact = YES;
         // currentRevision.
         [[self _cachedDocumentWithID: change.documentID] revisionAdded: change notify: NO];
     }
+
+    // Squish the change objects if too many of them are piling up:
+    if (_changesToNotify.count >= kManyChangesToNotify) {
+        if (_changesToNotify.count == kManyChangesToNotify) {
+            for (CBLDatabaseChange* c in _changesToNotify)
+                [c reduceMemoryUsage];
+        } else {
+            [change reduceMemoryUsage];
+        }
+    }
 }
 
 /** Posts a local NSNotification of multiple new revisions. */
@@ -381,15 +393,11 @@ static BOOL sAutoCompact = YES;
 
 - (CBL_Revision*) getDocumentWithID: (NSString*)docID
                          revisionID: (NSString*)inRevID
-                            options: (CBLContentOptions)options
+                           withBody: (BOOL)withBody
                              status: (CBLStatus*)outStatus
 {
-    CBL_MutableRevision* rev = [_storage getDocumentWithID: docID revisionID: inRevID
-                                            options: options status: outStatus];
-    if (rev && (options & kCBLIncludeAttachments))
-        if (![self expandAttachmentsIn: rev options: options status: outStatus])
-            rev = nil;
-    return rev;
+    return [_storage getDocumentWithID: docID revisionID: inRevID
+                              withBody: withBody status: outStatus];
 }
 
 
@@ -398,42 +406,37 @@ static BOOL sAutoCompact = YES;
                          revisionID: (NSString*)revID
 {
     CBLStatus status;
-    return [self getDocumentWithID: docID revisionID: revID options: 0 status: &status];
+    return [self getDocumentWithID: docID revisionID: revID withBody: YES status: &status];
 }
 #endif
 
 
-- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev
-                       options: (CBLContentOptions)options
-{
+- (CBLStatus) loadRevisionBody: (CBL_MutableRevision*)rev {
     // First check for no-op -- if we just need the default properties and already have them:
-    if (options==0 && rev.sequenceIfKnown) {
+    if (rev.sequenceIfKnown) {
         NSDictionary* props = rev.properties;
         if (props.cbl_rev && props.cbl_id)
             return kCBLStatusOK;
     }
     Assert(rev.docID && rev.revID);
 
-    CBLStatus status = [_storage loadRevisionBody: rev options: options];
-
-    if (status == kCBLStatusOK)
-        if (options & kCBLIncludeAttachments)
-            [self expandAttachmentsIn: rev options: options status: &status];
-    return status;
+    return [_storage loadRevisionBody: rev];
 }
 
 - (CBL_Revision*) revisionByLoadingBody: (CBL_Revision*)rev
-                                options: (CBLContentOptions)options
                                  status: (CBLStatus*)outStatus
 {
     // First check for no-op -- if we just need the default properties and already have them:
-    if (options==0 && rev.sequenceIfKnown) {
+    if (rev.sequenceIfKnown) {
         NSDictionary* props = rev.properties;
-        if (props.cbl_rev && props.cbl_id)
+        if (props.cbl_rev && props.cbl_id) {
+            if (outStatus)
+                *outStatus = kCBLStatusOK;
             return rev;
+        }
     }
     CBL_MutableRevision* nuRev = rev.mutableCopy;
-    CBLStatus status = [self loadRevisionBody: nuRev options: options];
+    CBLStatus status = [self loadRevisionBody: nuRev];
     if (outStatus)
         *outStatus = status;
     if (CBLStatusIsError(status))
@@ -498,7 +501,7 @@ static BOOL sAutoCompact = YES;
     CBLStatus status;
     CBL_Revision* rev = [self getDocumentWithID: [@"_design/" stringByAppendingString: path[0]]
                                     revisionID: nil
-                                        options: 0
+                                       withBody: YES
                                          status: &status];
     if (!rev)
         return nil;
@@ -573,19 +576,6 @@ static BOOL sAutoCompact = YES;
     [self doAsync:^{
         [[NSNotificationCenter defaultCenter] postNotification: notification];
     }];
-}
-
-
-    - (BOOL) createLocalCheckpointDocument: (NSError**)outError {
-    NSDictionary* document = @{ kCBLDatabaseLocalCheckpoint_LocalUUID : self.privateUUID };
-    BOOL result = [self putLocalDocument: document withID: kLocalCheckpointDocId error: outError];
-    if (!result)
-        Warn(@"CBLDatabase: Could not create a local checkpoint document with an error: %@", *outError);
-    return result;
-}
-
-- (NSDictionary*) getLocalCheckpointDocument {
-    return [self existingLocalDocumentWithID:kLocalCheckpointDocId];
 }
 
 

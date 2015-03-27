@@ -35,8 +35,11 @@ using namespace forestdb;
 
 #define kViewIndexPathExtension @"viewindex"
 
-// Size of ForestDB buffer cache allocated for a view index
-#define kViewBufferCacheSize (8*1024*1024)
+// Size of ForestDB buffer cache allocated for a database
+#define kDBBufferCacheSize (8*1024*1024)
+
+// ForestDB Write-Ahead Log size (# of records)
+#define kDBWALThreshold 1024
 
 // Close the index db after it's inactive this many seconds
 #define kCloseDelay 60.0
@@ -56,30 +59,50 @@ public:
 
 class CocoaIndexer : public MapReduceIndexer {
 public:
-    CocoaIndexer(std::vector<MapReduceIndex*> indexes, Transaction &t)
-    :MapReduceIndexer(indexes, t),
-     _sourceStore(indexes[0]->sourceStore())
-    { }
+    CocoaIndexer() { }
+
+    void addDocType(const alloc_slice& type) {
+        _docTypes.push_back(type);
+    }
+
+    void clearDocTypes() {
+        _docTypes.clear();
+    }
 
     virtual void addDocument(const Document& cppDoc) {
-        if (VersionedDocument::flagsOfDocument(cppDoc) & VersionedDocument::kDeleted) {
-            CocoaMappable mappable(cppDoc, nil);
-            addMappable(mappable);
-        } else {
+        bool indexIt = true;
+        VersionedDocument::Flags flags;
+        revid revID;
+        slice docType;
+        if (!VersionedDocument::readMeta(cppDoc, flags, revID, docType)) {
+            indexIt = false;
+        } else if (flags & VersionedDocument::kDeleted) {
+            indexIt = false;
+        } else if (_docTypes.size() > 0) {
+            if (std::find(_docTypes.begin(), _docTypes.end(), docType) == _docTypes.end())
+                indexIt = false;
+        }
+
+        if (indexIt) {
             @autoreleasepool {
-                VersionedDocument vdoc(_sourceStore, cppDoc);
+                VersionedDocument vdoc(_indexes[0]->sourceStore(), cppDoc);
                 const Revision* node = vdoc.currentRevision();
-                NSDictionary* body = [CBLForestBridge bodyOfNode: node
-                                                         options: kCBLIncludeLocalSeq];
+                NSMutableDictionary* body = [CBLForestBridge bodyOfNode: node];
+                body[@"_local_seq"] = @(node->sequence);
+
                 LogTo(ViewVerbose, @"Mapping %@ rev %@", body.cbl_id, body.cbl_rev);
                 CocoaMappable mappable(cppDoc, body);
                 addMappable(mappable);
             }
+        } else {
+            // Have to at least run a nil doc through addMappable, to remove obsolete old rows
+            CocoaMappable mappable(cppDoc, nil);
+            addMappable(mappable);
         }
     }
 
 private:
-    KeyStore _sourceStore;
+    std::vector<alloc_slice> _docTypes;
 };
 
 
@@ -87,35 +110,48 @@ class MapReduceBridge : public MapFn {
 public:
     CBLMapBlock mapBlock;
     NSString* viewName;
+    NSString* documentType;
     CBLViewIndexType indexType;
 
     virtual void operator() (const Mappable& mappable, EmitFn& emitFn) {
-        NSDictionary* doc = ((CocoaMappable&)mappable).body;
-        if (!doc)
-            return;
-        CBLMapEmitBlock emit = ^(id key, id value) {
-            if (indexType == kCBLFullTextIndex) {
-                Assert([key isKindOfClass: [NSString class]]);
-                LogTo(ViewVerbose, @"    emit(\"%@\", %@)", key, toJSONStr(value));
-                emitFn.emitTextTokens(nsstring_slice(key));
-            } else if ([key isKindOfClass: [CBLSpecialKey class]]) {
-                CBLSpecialKey *specialKey = key;
-                LogTo(ViewVerbose, @"    emit(%@, %@)", specialKey, toJSONStr(value));
-                NSString* text = specialKey.text;
-                if (text) {
-                    emitFn.emitTextTokens(nsstring_slice(text));
-                } else {
-                    emitGeo(specialKey.rect, value, doc, emitFn);
+            NSDictionary* doc = ((CocoaMappable&)mappable).body;
+            if (!doc)
+                return; // doc is deleted or otherwise not to be indexed
+            if (documentType && ![documentType isEqual: doc[@"type"]])
+                return;
+            CBLMapEmitBlock emit = ^(id key, id value) {
+                if (indexType == kCBLFullTextIndex) {
+                    Assert([key isKindOfClass: [NSString class]]);
+                    LogTo(ViewVerbose, @"    emit(\"%@\", %@)", key, toJSONStr(value));
+                    emitText(key, value, doc, emitFn);
+                } else if ([key isKindOfClass: [CBLSpecialKey class]]) {
+                    CBLSpecialKey *specialKey = key;
+                    LogTo(ViewVerbose, @"    emit(%@, %@)", specialKey, toJSONStr(value));
+                    NSString* text = specialKey.text;
+                    if (text) {
+                        emitText(text, value, doc, emitFn);
+                    } else {
+                        emitGeo(specialKey.rect, value, doc, emitFn);
+                    }
+                } else if (key) {
+                    LogTo(ViewVerbose, @"    emit(%@, %@)  to %@", toJSONStr(key), toJSONStr(value), viewName);
+                    callEmit(key, value, doc, emitFn);
                 }
-            } else if (key) {
-                LogTo(ViewVerbose, @"    emit(%@, %@)  to %@", toJSONStr(key), toJSONStr(value), viewName);
-                callEmit(key, value, doc, emitFn);
-            }
-        };
-        mapBlock(doc, emit);  // Call the apps' map block!
-    }
+            };
+            mapBlock(doc, emit);  // Call the apps' map block!
+        }
 
 private:
+    // Emit a full-text row
+    void emitText(NSString* text, id value, NSDictionary* doc, EmitFn& emitFn) {
+        Collatable collValue;
+        if (value == doc)
+            collValue.addSpecial(); // placeholder for doc
+        else if (value)
+            collValue << value;
+        emitFn.emitTextTokens(nsstring_slice(text), collValue);
+    }
+
     // Geo-index a rectangle
     void emitGeo(CBLGeoRect rect, id value, NSDictionary* doc, EmitFn& emitFn) {
         geohash::area area(geohash::coord(rect.min.x, rect.min.y),
@@ -267,10 +303,10 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
         Assert(!_indexDB);
         auto config = Database::defaultConfig();
         config.flags = options;
-        config.buffercache_size = kViewBufferCacheSize;
-        config.wal_threshold = 8192;
+        config.buffercache_size = kDBBufferCacheSize;
+        config.wal_threshold = kDBWALThreshold;
         config.wal_flush_before_commit = true;
-        config.seqtree_opt = YES;
+        config.seqtree_opt = NO; // indexes don't need by-sequence ordering
         config.compaction_threshold = 50;
         try {
             _indexDB = new Database(_path.fileSystemRepresentation, config);
@@ -358,12 +394,14 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
     _mapReduceBridge.mapBlock = delegate.mapBlock;
     _mapReduceBridge.viewName = _name;
     _mapReduceBridge.indexType = _indexType;
+    _mapReduceBridge.documentType = delegate.documentType;
+    NSString* mapVersion = delegate.mapVersion;
     MapReduceIndex* index = [self openIndex: outStatus]; // open db
     if (!index)
         return NULL;
-    {
+    if (mapVersion) {
         Transaction t(_indexDB);
-        index->setup(t, _indexType, &_mapReduceBridge, delegate.mapVersion.UTF8String);
+        index->setup(t, _indexType, &_mapReduceBridge, mapVersion.UTF8String);
     }
     return index;
 }
@@ -376,35 +414,41 @@ static NSString* viewNames(NSArray* views) {
 
 - (CBLStatus) updateIndexes: (NSArray*)views {
     LogTo(View, @"Checking indexes of (%@) for %@", viewNames(views), _name);
-    try {
+    return [_dbStorage _try: ^{
         CBLStatus status;
-        std::vector<MapReduceIndex*> indexes;
+        CocoaIndexer indexer;
+        indexer.triggerOnIndex(_index);
+        BOOL useDocTypes = YES;
         for (CBL_ForestDBViewStorage* viewStorage in views) {
             MapReduceIndex* index = [viewStorage setupIndex: &status];
             if (!index)
                 return status;
-            if (viewStorage.delegate.mapBlock)
-                indexes.push_back(index);
-            else
+            id<CBL_ViewStorageDelegate> delegate = viewStorage.delegate;
+            if (!delegate.mapBlock) {
                 LogTo(ViewVerbose, @"    %@ has no map block; skipping it", viewStorage.name);
+                continue;
+            }
+            indexer.addIndex(index, new Transaction(viewStorage->_indexDB));
+            if (useDocTypes) {
+                NSString* docType = delegate.documentType;
+                if (docType) {
+                    nsstring_slice s(docType);
+                    indexer.addDocType(alloc_slice(s));
+                } else {
+                    indexer.clearDocTypes();
+                    useDocTypes = NO;
+                }
+            }
         }
-        if (![self openIndex: &status])
-            return status;
-        bool updated;
-        {
-            Transaction t(_indexDB);
-            CocoaIndexer indexer(indexes, t);
-            indexer.triggerOnIndex(_index);
-            updated = indexer.run();
+        if (indexer.run()) {
+            LogTo(View, @"... Finished re-indexing (%@) to #%lld",
+                  viewNames(views), indexer.latestDbSequence());
+            return kCBLStatusOK;
+        } else {
+            LogTo(View, @"... Nothing to do.");
+            return kCBLStatusNotModified;
         }
-        return updated ? kCBLStatusOK : kCBLStatusNotModified;
-    } catch (forestdb::error x) {
-        Warn(@"Error indexing %@: ForestDB error %d", self, x.status);
-        return CBLStatusFromForestDBStatus(x.status);
-    } catch (...) {
-        Warn(@"Unexpected exception indexing %@", self);
-        return kCBLStatusException;
-    }
+    }];
 }
 
 
@@ -505,14 +549,14 @@ static NSString* viewNames(NSArray* views) {
                         CBLStatus linkedStatus;
                         CBL_Revision* linked = [_dbStorage getDocumentWithID: linkedID
                                                           revisionID: linkedRev
-                                                             options: options->content
+                                                             withBody: YES
                                                               status: &linkedStatus];
                         docContents = linked ? linked.properties : $null;
                         sequence = linked.sequence;
                     } else {
                         CBLStatus status;
                         CBL_Revision* rev = [_dbStorage getDocumentWithID: docID revisionID: nil
-                                                          options: options->content status: &status];
+                                                          withBody: YES status: &status];
                         docContents = rev.properties;
                     }
                 }
@@ -541,6 +585,8 @@ static NSString* viewNames(NSArray* views) {
             }
         } catch (forestdb::error x) {
             Warn(@"Unexpected ForestDB error iterating query (status %d)", x.status);
+        } catch (NSException* x) {
+            MYReportException(x, @"CBL_ForestDBViewStorage");
         } catch (...) {
             Warn(@"Unexpected CBForest exception iterating query");
         }
@@ -651,6 +697,8 @@ static id keyForPrefixMatch(id key, unsigned depth) {
             return row;
         } catch (forestdb::error x) {
             Warn(@"Unexpected ForestDB error iterating query (status %d)", x.status);
+        } catch (NSException* x) {
+            MYReportException(x, @"CBL_ForestDBViewStorage");
         } catch (...) {
             Warn(@"Unexpected CBForest exception iterating query");
         }
@@ -769,9 +817,14 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
             id key = fullTextID > 0 ? @[docID, @(fullTextID)] : docID;
             CBLFullTextQueryRow* row = docRows[key];
             if (!row) {
+                alloc_slice valueSlice = index->readFullTextValue(nsstring_slice(docID),
+                                                                  e.sequence(),
+                                                                  fullTextID);
+                NSData* valueData = valueSlice.copiedNSData();
                 row = [[CBLFullTextQueryRow alloc] initWithDocID: docID
                                                         sequence: e.sequence()
                                                       fullTextID: fullTextID
+                                                           value: valueData
                                                          storage: self];
                 docRows[key] = row;
             }
@@ -832,8 +885,7 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
              self, docID, sequence, fullTextID);
         return nil;
     }
-    CollatableReader value(valueSlice);
-    return value.readString().copiedNSData();
+    return valueSlice.copiedNSData();
 }
 
 

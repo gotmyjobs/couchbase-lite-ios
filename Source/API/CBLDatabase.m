@@ -40,9 +40,6 @@
 // Size of document cache: max # of otherwise-unreferenced docs that will be kept in memory.
 #define kDocRetainLimit 50
 
-// Default value for maxRevTreeDepth, the max rev depth to preserve in a prune operation
-#define kDefaultMaxRevs 20
-
 NSString* const kCBLDatabaseChangeNotification = @"CBLDatabaseChange";
 
 
@@ -53,7 +50,6 @@ static id<CBLFilterCompiler> sFilterCompiler;
 {
     CBLCache* _docCache;
     NSMutableSet* _allReplications;
-    NSUInteger _maxRevTreeDepth;
 }
 
 
@@ -239,16 +235,14 @@ static void catchInBlock(void (^block)()) {
 }
 
 - (NSUInteger) maxRevTreeDepth {
-    if (_maxRevTreeDepth == 0)
-        _maxRevTreeDepth = [[_storage infoForKey: @"max_revs"] intValue] ?: kDefaultMaxRevs;
-    return _maxRevTreeDepth;
+    return _storage.maxRevTreeDepth;
 }
 
 - (void) setMaxRevTreeDepth: (NSUInteger)maxRevs {
     if (maxRevs == 0)
         maxRevs = kDefaultMaxRevs;
-    if (maxRevs != self.maxRevTreeDepth) {
-        _maxRevTreeDepth = maxRevs;
+    if (maxRevs != _storage.maxRevTreeDepth) {
+        _storage.maxRevTreeDepth = (unsigned)maxRevs;
         [_storage setInfo: $sprintf(@"%lu", (unsigned long)maxRevs) forKey: @"max_revs"];
     }
 }
@@ -270,7 +264,7 @@ static void catchInBlock(void (^block)()) {
 #pragma mark - DOCUMENTS:
 
 
-- (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist {
+- (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist isNew: (BOOL)isNew {
     CBLDocument* doc = (CBLDocument*) [_docCache resourceWithCacheKey: docID];
     if (doc) {
         if (mustExist && doc.currentRevision == nil)  // loads current revision from db
@@ -279,7 +273,9 @@ static void catchInBlock(void (^block)()) {
     }
     if (docID.length == 0)
         return nil;
-    doc = [[CBLDocument alloc] initWithDatabase: self documentID: docID];
+    doc = [[CBLDocument alloc] initWithDatabase: self
+                                     documentID: docID
+                                         exists: !isNew];
     if (!doc)
         return nil;
     if (mustExist && doc.currentRevision == nil)  // loads current revision from db
@@ -292,19 +288,19 @@ static void catchInBlock(void (^block)()) {
 
 
 - (CBLDocument*) documentWithID: (NSString*)docID {
-    return [self documentWithID: docID mustExist: NO];
+    return [self documentWithID: docID mustExist: NO isNew: NO];
 }
 
 - (CBLDocument*) existingDocumentWithID: (NSString*)docID {
-    return [self documentWithID: docID mustExist: YES];
+    return [self documentWithID: docID mustExist: YES isNew: NO];
 }
 
 - (CBLDocument*) objectForKeyedSubscript: (NSString*)key {
-    return [self documentWithID: key mustExist: NO];
+    return [self documentWithID: key mustExist: NO isNew: NO];
 }
 
 - (CBLDocument*) createDocument {
-    return [self documentWithID: [[self class] generateDocumentID] mustExist: NO];
+    return [self documentWithID: [[self class] generateDocumentID] mustExist: NO isNew: YES];
 }
 
 
