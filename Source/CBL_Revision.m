@@ -207,39 +207,47 @@
 /** Returns the JSON to be stored into the database.
     This has all the special keys like "_id" stripped out, and keys in canonical order. */
 + (NSData*) asCanonicalJSON: (UU NSDictionary*)properties error: (NSError**)outError {
-    static NSSet* sSpecialKeysToRemove, *sSpecialKeysToLeave;
+    // Initialize the key filter that will strip out top level "_"-prefixed keys:
+    static CBJSONEncoderKeyFilter sKeyFilter;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        sSpecialKeysToRemove = [[NSSet alloc] initWithObjects: @"_id", @"_rev",
-                                @"_deleted", @"_revisions", @"_revs_info", @"_conflicts", @"_deleted_conflicts",
-                                @"_local_seq", nil];
-        sSpecialKeysToLeave = [[NSSet alloc] initWithObjects:
+        NSSet* specialKeysToRemove, *specialKeysToLeave;
+        specialKeysToRemove = [[NSSet alloc] initWithObjects: @"_id", @"_rev",
+                                       @"_deleted", @"_revisions", @"_revs_info", @"_conflicts",
+                                       @"_deleted_conflicts", @"_local_seq", nil];
+        specialKeysToLeave = [[NSSet alloc] initWithObjects:
                                @"_attachments", @"_removed", nil];
+        sKeyFilter = ^BOOL(NSString* key, NSError** outError) {
+            if (![key hasPrefix: @"_"]) {
+                return YES;
+            } else if ([specialKeysToRemove member: key]) {
+                return NO;
+            } else if ([specialKeysToLeave member: key]) {
+                return YES;
+            } else {
+                Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
+                return ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
+            }
+        };
     });
 
-    if (!properties)
+    if (!properties) {
+        ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
         return nil;
-
-    // Don't leave in any "_"-prefixed keys except for the ones in sSpecialKeysToLeave.
-    // Keys in sSpecialKeysToRemove (_id, _rev, ...) are left out, any others trigger an error.
-    NSMutableDictionary* editedProperties = nil;
-    for (NSString* key in properties) {
-        if ([key hasPrefix: @"_"]  && ![sSpecialKeysToLeave member: key]) {
-            if (![sSpecialKeysToRemove member: key]) {
-                Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
-                return nil;
-            }
-            if (!editedProperties)
-                editedProperties = [properties mutableCopy];
-            [editedProperties removeObjectForKey: key];
-        }
     }
 
     // Create canonical JSON -- this is important, because the JSON data returned here will be used
     // to create the new revision ID, and we need to guarantee that equivalent revision bodies
     // result in equal revision IDs.
-    return [CBJSONEncoder canonicalEncoding: (editedProperties ?: properties)
-                                      error: outError];
+    CBJSONEncoder* encoder = [[CBJSONEncoder alloc] init];
+    encoder.canonical = YES;
+    encoder.keyFilter = sKeyFilter;
+    if (![encoder encode: properties]) {
+        if (outError)
+            *outError = encoder.error;
+        return nil;
+    }
+    return encoder.encodedData;
 }
 
 
@@ -278,11 +286,12 @@
 }
 
 - (void) setProperties:(UU NSDictionary *)properties {
-    self.body = [[CBL_Body alloc] initWithProperties: properties];
+    _body = [[CBL_Body alloc] initWithProperties: properties];
 }
 
 - (void) setAsJSON:(UU NSData *)asJSON {
-    self.body = [[CBL_Body alloc] initWithJSON: asJSON];
+    _body = [[CBL_Body alloc] initWithJSON: asJSON
+                               addingDocID: _docID revID: _revID deleted: _deleted];
 }
 
 - (void) setObject: (UU id)object forKeyedSubscript: (UU NSString*)key {

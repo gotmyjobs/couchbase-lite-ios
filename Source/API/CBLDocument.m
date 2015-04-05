@@ -200,10 +200,10 @@ NSString* const kCBLDocumentChangeNotification = @"CBLDocumentChange";
         return;
     if (!_currentRevision || CBLCompareRevIDs(revID, _currentRevision.revisionID) > 0) {
         [self forgetCurrentRevision];
-        NSDictionary* properties = row.documentProperties;
-        if (properties) {
-            CBL_Revision* rev = [CBL_Revision revisionWithProperties: properties];
+        CBL_Revision* rev = row.documentRevision;
+        if (rev) {
             _currentRevision = [[CBLSavedRevision alloc] initWithDocument: self revision: rev];
+            _currentRevisionKnown = YES;
         }
     }
 }
