@@ -316,6 +316,20 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
                                     {@"doc", $dict({@"message", @"bonjour"},
                                                    {@"_id", @"doc3"}, {@"_rev", revID3} )})
                               ));
+
+    // keys:
+    result = SendBody(self, @"POST", @"/db/_all_docs",
+                      $dict({@"keys", $array(@"doc1", @"doc2", @"doc3", @"doc4")}),
+                      kCBLStatusOK, nil);
+    rows = result[@"rows"];
+    AssertEqual(rows, $array($dict({@"id",  @"doc1"}, {@"key", @"doc1"},
+                                   {@"value", $dict({@"rev", revID})}),
+                             $dict({@"id",  @"doc2"}, {@"key", @"doc2"},
+                                   {@"value", $dict({@"rev", revID2})}),
+                             $dict({@"id",  @"doc3"}, {@"key", @"doc3"},
+                                   {@"value", $dict({@"rev", revID3})}),
+                             $dict({@"error",  @"not_found"}, {@"key", @"doc4"})
+                             ));
 }
 
 
@@ -800,7 +814,86 @@ static void CheckCacheable(Router_Tests* self, NSString* path) {
 }
 
 
+- (void) test_ChangesDescending {
+    RequireTestCase(Changes);
+    NSArray* revIDs = [self populateDocs];
+
+    // _changes with descending = false
+    Send(self, @"GET", @"/db/_changes?descending=false", kCBLStatusOK,
+         $dict({@"last_seq", @5},
+               {@"results", $array($dict({@"id", @"doc3"},
+                                         {@"changes", $array($dict({@"rev", revIDs[2]}))},
+                                         {@"seq", @3}),
+                                   $dict({@"id", @"doc2"},
+                                         {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                         {@"seq", @4}),
+                                   $dict({@"id", @"doc1"},
+                                         {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                         {@"seq", @5},
+                                         {@"deleted", $true}))}));
+    if (self.isSQLiteDB ) {
+        // _changes with descending = true
+        Send(self, @"GET", @"/db/_changes?descending=true", kCBLStatusOK,
+             $dict({@"last_seq", @3},
+                   {@"results", $array($dict({@"id", @"doc1"},
+                                             {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                             {@"seq", @5},
+                                             {@"deleted", $true}),
+                                       $dict({@"id", @"doc2"},
+                                             {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                             {@"seq", @4}),
+                                       $dict({@"id", @"doc3"},
+                                             {@"changes", $array($dict({@"rev", revIDs[2]}))},
+                                             {@"seq", @3}))}));
+
+
+        // _changes with descending = true and limit = 2
+        Send(self, @"GET", @"/db/_changes?descending=true&limit=2", kCBLStatusOK,
+             $dict({@"last_seq", @4},
+                   {@"results", $array($dict({@"id", @"doc1"},
+                                             {@"changes", $array($dict({@"rev", revIDs[0]}))},
+                                             {@"seq", @5},
+                                             {@"deleted", $true}),
+                                       $dict({@"id", @"doc2"},
+                                             {@"changes", $array($dict({@"rev", revIDs[1]}))},
+                                             {@"seq", @4}))}));
+
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=continuous", kCBLStatusBadParam, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=longpoll", kCBLStatusBadParam, nil);
+    } else {
+        // https://github.com/couchbase/couchbase-lite-ios/issues/641
+        Send(self, @"GET", @"/db/_changes?descending=true", kCBLStatusNotImplemented, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&limit=2", kCBLStatusNotImplemented, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=continuous", kCBLStatusBadParam, nil);
+        Send(self, @"GET", @"/db/_changes?descending=true&feed=longpoll", kCBLStatusBadParam, nil);
+    }
+}
+
+
 #pragma mark - ATTACHMENTS:
+
+
+- (void) test_PutAttachmentToNewDoc {
+    CBLResponse* response = SendRequest(self, @"PUT", @"/db/doc1/attach.txt",
+                                        @{@"Content-Type": @"text/plain"},
+                                        [@"Hello there" dataUsingEncoding: NSUTF8StringEncoding]);
+    AssertEq(response.status, 201);
+}
+
+
+- (void) test_PutAttachmentToExistingDoc {
+    NSDictionary* props = $dict({@"message", @"hello"});
+    NSDictionary* result = SendBody(self, @"PUT", @"/db/doc1", props, kCBLStatusCreated, nil);
+    NSString* rev = result[@"rev"];
+    Assert(rev);
+
+    CBLResponse* response;
+    response = SendRequest(self, @"PUT",
+                           $sprintf(@"/db/doc1/attach.txt?rev=%@", rev),
+                           @{@"Content-Type": @"text/plain"},
+                           [@"Hello there" dataUsingEncoding: NSUTF8StringEncoding]);
+    AssertEq(response.status, 200);
+}
 
 
 - (NSDictionary*) createDocWithAttachment: (NSData*)attach1 and: (NSData*) attach2 {
