@@ -691,7 +691,7 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
     Assert([importDb deleteDatabase:&error], @"Couldn't delete db: %@", error);
 }
 
-- (void) test12_StopIdlePush {
+- (void) test12_StopIdlePushReplication {
     NSURL* remoteDbURL = [self remoteTestDBURL: kPushThenPullDBName];
     if (!remoteDbURL)
         return;
@@ -902,6 +902,71 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
     Assert(myAttachment[@"revpos"]);
     int revpos = [myAttachment[@"revpos"] intValue];
     AssertEq(revpos, 2);
+}
+
+- (void) test16_Restart {
+    NSURL* remoteDbURL = [self remoteTestDBURL: kPushThenPullDBName];
+    if (!remoteDbURL)
+        return;
+    [self eraseRemoteDB: remoteDbURL];
+
+    // Pusher:
+    CBLReplication* pusher = [db createPushReplication: remoteDbURL];
+    pusher.continuous = YES;
+    [pusher start];
+    [pusher restart];
+
+    // Wait to get a notification when the replication is idle:
+    NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0];
+    while (pusher.status != kCBLReplicationIdle && timeout.timeIntervalSinceNow > 0.0) {
+        if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
+                                      beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
+            break;
+    }
+
+    // Make sure the replication is now idle:
+    AssertEq(pusher.status, kCBLReplicationIdle);
+
+    // Stop the replicator now:
+    [pusher stop];
+    timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0];
+    while (pusher.status != kCBLReplicationStopped && timeout.timeIntervalSinceNow > 0.0) {
+        if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
+                                      beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
+            break;
+    }
+
+    // Make sure the replication is stopped:
+    AssertEq(pusher.status, kCBLReplicationStopped);
+
+    // Puller:
+    CBLReplication* puller = [db createPullReplication: remoteDbURL];
+    puller.continuous = YES;
+    [puller start];
+    [puller restart];
+
+    // Wait to get a notification when the replication is idle:
+    timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0];
+    while (puller.status != kCBLReplicationIdle && timeout.timeIntervalSinceNow > 0.0) {
+        if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
+                                      beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
+            break;
+    }
+
+    // Make sure the replication is now idle:
+    AssertEq(puller.status, kCBLReplicationIdle);
+
+    // Stop the replicator now:
+    [puller stop];
+    timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0];
+    while (puller.status != kCBLReplicationStopped && timeout.timeIntervalSinceNow > 0.0) {
+        if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
+                                      beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
+            break;
+    }
+
+    // Make sure the replication is stopped:
+    AssertEq(puller.status, kCBLReplicationStopped);
 }
 
 @end

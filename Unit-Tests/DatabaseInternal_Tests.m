@@ -847,4 +847,61 @@ static CBL_Revision* mkrev(NSString* revID) {
 #endif
 #endif
 
+-(void) test26_ReAddAfterPurge {
+  
+  NSString* docId = @"test26-ReAddAfterPurge";
+  
+  CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID:docId revID:@"1-1111" deleted: NO];
+  rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"testName", @"test26_ReAddAfterPurge"});
+  CBLStatus status = [db forceInsert: rev revisionHistory: nil source: nil];
+  AssertEq(status, kCBLStatusCreated);
+  
+  CBLDocument* redoc = [db existingDocumentWithID:docId];
+  Assert(redoc);
+  
+  NSError* error;
+  Assert([redoc purgeDocument: &error]);
+  
+  [self reopenTestDB];
+  
+  CBL_MutableRevision* revAfterPurge = [[CBL_MutableRevision alloc] initWithDocID:docId revID:@"1-1111" deleted: NO];
+  revAfterPurge.properties = $dict({@"_id", revAfterPurge.docID}, {@"_rev", revAfterPurge.revID}, {@"testName", @"test26_ReAddAfterPurge"});
+  CBLStatus status2 = [db forceInsert: revAfterPurge revisionHistory: nil source: nil];
+  AssertEq(status2, kCBLStatusCreated);
+}
+
+
+- (void) test27_ChangesSinceSequence {
+    // Create 10 docs:
+    [self createDocuments: 10];
+
+    // Create a new doc with a conflict:
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"1-1111" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    NSArray* history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil], 201);
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID" revID: @"1-ffff" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"bye"});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil], 201);
+
+    // Get changes, testing all combinations of includeConflicts and includeDocs:
+    for (int conflicts=0; conflicts <= 1; conflicts++) {
+        for (int bodies=0; bodies <= 1; bodies++) {
+            CBLChangesOptions options = kDefaultCBLChangesOptions;
+            options.includeConflicts = (BOOL)conflicts;
+            options.includeDocs = (BOOL)bodies;
+            CBLStatus status;
+            CBL_RevisionList* changes = [db changesSinceSequence: 0 options: &options filter: NULL params: nil status: &status];
+            AssertEq(changes.count, 11u + conflicts);
+            for (CBL_Revision* change in changes) {
+                if (bodies)
+                    Assert(change.body != nil);
+                else
+                    AssertNil(change.body);
+            }
+        }
+    }
+}
+
 @end

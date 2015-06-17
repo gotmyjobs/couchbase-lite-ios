@@ -89,6 +89,12 @@
 - (void) setBonjourName: (NSString*)name type: (NSString*)type {
     _httpServer.name = name;
     _httpServer.type = type;
+    if (_httpServer.isRunning)
+        [_httpServer republishBonjour];
+}
+
+- (NSString*) bonjourName {
+    return _httpServer.publishedName;
 }
 
 - (NSDictionary *)TXTRecordDictionary                   {return _httpServer.TXTRecordDictionary;}
@@ -165,7 +171,7 @@
 }
 
 + (void) runTestCases {
-#if DEBUG
+#if DEBUG && MY_ENABLE_TESTS
     const char* argv[] = {"Test_All"};
     RunTestCases(1, argv);
 #endif

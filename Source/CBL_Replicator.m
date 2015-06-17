@@ -84,6 +84,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     BOOL _suspended;
     SecCertificateRef _serverCert;
     NSData* _pinnedCertData;
+    CBLCookieStorage* _cookieStorage;
 }
 
 @synthesize revisionBodyTransformationBlock=_revisionBodyTransformationBlock;
@@ -119,10 +120,6 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
         _remote = remote;
         _continuous = continuous;
         Assert(push == self.isPush);
-
-        _cookieStorage = [[CBLCookieStorage alloc] initWithDB: db
-                                                   storageKey: self.remoteCheckpointDocID];
-
         static int sLastSessionID = 0;
         _sessionID = [$sprintf(@"repl%03d", ++sLastSessionID) copy];
 #if TARGET_OS_IPHONE
@@ -153,13 +150,6 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 }
 
 
-- (void) clearCookieStorageRef {
-    // Explicitly clear the reference to the storage to ensure that the cookie storage will
-    // get dealloc and the database referenced inside the storage will get cleared as well.
-    _cookieStorage = nil;
-}
-
-
 - (void) databaseClosing {
     [self saveLastSequence];
     [self stop];
@@ -181,7 +171,6 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 @synthesize authorizer=_authorizer;
 @synthesize requestHeaders = _requestHeaders;
 @synthesize serverCert=_serverCert;
-@synthesize cookieStorage = _cookieStorage;
 
 
 - (BOOL) isPush {
@@ -192,7 +181,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 - (bool) hasSameSettingsAs: (CBL_Replicator*)other {
     // Needs to be consistent with -remoteCheckpointDocID:
     // If a.remoteCheckpointID == b.remoteCheckpointID then [a hasSameSettingsAs: b]
-    return _db == other->_db && $equal(_remote, other->_remote) && self.isPush == other.isPush
+    return _db == other->_db && self.isPush == other.isPush
         && $equal(self.remoteCheckpointDocID, other.remoteCheckpointDocID);
 }
 
@@ -746,6 +735,21 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
 #pragma mark - HTTP REQUESTS:
 
 
+- (CBLCookieStorage*) cookieStorage {
+    if (!_cookieStorage) {
+        _cookieStorage = [[CBLCookieStorage alloc] initWithDB: _db
+                                                   storageKey: self.remoteCheckpointDocID];
+    }
+    return _cookieStorage;
+}
+
+- (void) clearCookieStorageRef {
+    // Explicitly clear the reference to the storage to ensure that the cookie storage will
+    // get dealloc and the database referenced inside the storage will get cleared as well.
+    _cookieStorage = nil;
+}
+
+
 - (NSTimeInterval) requestTimeout {
     id timeoutObj = _options[kCBLReplicatorOption_Timeout];
     if (!timeoutObj)
@@ -811,7 +815,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
     request.delegate = self;
     request.timeoutInterval = self.requestTimeout;
     request.authorizer = _authorizer;
-    request.cookieStorage = _cookieStorage;
+    request.cookieStorage = self.cookieStorage;
 
     if (!_remoteRequests)
         _remoteRequests = [[NSMutableArray alloc] init];
@@ -881,6 +885,13 @@ static BOOL sOnlyTrustAnchorCerts;
             Warn(@"%@: SecTrustEvaluate failed with err %d", self, (int)err);
             return NO;
         }
+        if (result == kSecTrustResultRecoverableTrustFailure) {
+            // Accept a self-signed cert from a local host (".local" domain)
+            if (SecTrustGetCertificateCount(trust) == 1 &&
+                    ([host hasSuffix: @".local"] || [host hasSuffix: @".local."])) {
+                result = kSecTrustResultUnspecified;
+            }
+        }
         if (result != kSecTrustResultProceed && result != kSecTrustResultUnspecified) {
             Warn(@"%@: SSL cert is not trustworthy (result=%d)", self, result);
             return NO;
@@ -916,13 +927,19 @@ static BOOL sOnlyTrustAnchorCerts;
     // Needs to be consistent with -hasSameSettingsAs: --
     // If a.remoteCheckpointID == b.remoteCheckpointID then [a hasSameSettingsAs: b]
     NSMutableDictionary* spec = $mdict({@"localUUID", localUUID},
-                                       {@"remoteURL", _remote.absoluteString},
                                        {@"push", @(self.isPush)},
                                        {@"continuous", (self.continuous ? nil : $false)},
                                        {@"filter", _filterName},
                                        {@"filterParams", _filterParameters},
                                        //{@"headers", _requestHeaders}, (removed; see #143)
                                        {@"docids", _docIDs});
+    // If "remoteUUID" option is specified, use that instead of the remote URL:
+    NSString* remoteUUID = _options[kCBLReplicatorOption_RemoteUUID];
+    if (remoteUUID)
+        spec[@"remoteUUID"] = remoteUUID;
+    else
+        spec[@"remoteURL"] = _remote.absoluteString;
+
     NSError *error;
     NSString *remoteCheckpointDocID = CBLHexSHA1Digest([CBJSONEncoder canonicalEncoding: spec
                                                                          error: &error]);
