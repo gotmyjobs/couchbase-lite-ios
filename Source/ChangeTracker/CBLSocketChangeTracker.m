@@ -23,7 +23,7 @@
 #import "CBLBase64.h"
 #import "MYBlockUtils.h"
 #import "MYURLUtils.h"
-#import "WebSocketHTTPLogic.h"
+#import "BLIPHTTPLogic.h"
 #import <string.h>
 
 
@@ -32,7 +32,6 @@
 
 @implementation CBLSocketChangeTracker
 {
-    WebSocketHTTPLogic* _http;
     NSInputStream* _trackingInput;
     CFAbsoluteTime _startTime;
     bool _gotResponseHeaders;
@@ -48,42 +47,7 @@
 
     NSURL* url = self.changesFeedURL;
 
-    if (!_http) {
-        NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: url];
-        if (self.usePOST) {
-            urlRequest.HTTPMethod = @"POST";
-            urlRequest.HTTPBody = self.changesFeedPOSTBody;
-            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
-        }
-
-        for (NSString* key in self.requestHeaders) {
-            if ([key caseInsensitiveCompare: @"Cookie"] == 0) {
-                urlRequest.HTTPShouldHandleCookies = NO;
-                break;
-            }
-        }
-
-        if (urlRequest.HTTPShouldHandleCookies) {
-            [self.cookieStorage addCookieHeaderToRequest: urlRequest];
-        }
-
-        _http = [[WebSocketHTTPLogic alloc] initWithURLRequest: urlRequest];
-
-        // Add headers from my .requestHeaders property:
-        [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
-            _http[key] = value;
-        }];
-    }
-
     CFHTTPMessageRef request = [_http newHTTPRequest];
-
-    if (_authorizer && !_http.credential) {
-        // Let the Authorizer add its own credential:
-        NSString* authHeader = [_authorizer authorizeHTTPMessage: request forRealm: nil];
-        if (authHeader)
-            CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Authorization"),
-                                             (__bridge CFStringRef)(authHeader));
-    }
 
     // Now open the connection:
     LogTo(SyncVerbose, @"%@: %@ %@", self, (self.usePOST ?@"POST" :@"GET"), url.resourceSpecifier);
@@ -152,6 +116,13 @@
 
         trusted = [self checkServerTrust: sslTrust forURL: url];
         CFRelease(sslTrust);
+        if (!trusted) {
+            //TODO: This error could be made more precise
+            LogTo(ChangeTracker, @"%@: Rejected server certificate", self);
+            [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
+                                                       code: NSURLErrorServerCertificateUntrusted
+                                                   userInfo: nil]];
+        }
     }
     return trusted;
 }
@@ -161,7 +132,12 @@
     CFHTTPMessageRef response;
     response = (CFHTTPMessageRef) CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                            kCFStreamPropertyHTTPResponseHeader);
-    Assert(response);
+    if (!response) {
+        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
+                                                   code: NSURLErrorNetworkConnectionLost
+                                               userInfo: nil]];
+        return NO;
+    }
     _gotResponseHeaders = true;
     [_http receivedResponse: response];
     CFRelease(response);
@@ -175,7 +151,8 @@
         [self retry];
         return NO;
     } else {
-        NSError* error = _http.error ?: CBLStatusToNSError(_http.httpStatus, _http.URL);
+        NSError* error = _http.error ?: CBLStatusToNSErrorWithInfo(_http.httpStatus,
+                                                                   nil, _http.URL, nil);
         [self failedWithError: error];
         return NO;
     }
@@ -206,10 +183,9 @@
 
 - (void) handleEOF {
     if (!_gotResponseHeaders) {
-        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                   code: NSURLErrorNetworkConnectionLost
-                                               userInfo: nil]];
-        return;
+        [self readResponseHeader];
+        if (!_gotResponseHeaders)
+            return;
     }
     if (_mode == kContinuous) {
         [self stop];

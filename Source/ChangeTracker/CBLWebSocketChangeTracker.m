@@ -16,8 +16,10 @@
 #import "CBLWebSocketChangeTracker.h"
 #import "CBLAuthorizer.h"
 #import "CBLCookieStorage.h"
-#import "WebSocketClient.h"
+#import "PSWebSocket.h"
+#import "BLIPHTTPLogic.h"
 #import "CBLMisc.h"
+#import "CBLStatus.h"
 #import "MYBlockUtils.h"
 #import <libkern/OSAtomic.h>
 
@@ -25,14 +27,14 @@
 #define kMaxPendingMessages 2
 
 
-@interface CBLWebSocketChangeTracker () <WebSocketDelegate>
+@interface CBLWebSocketChangeTracker () <PSWebSocketDelegate>
 @end
 
 
 @implementation CBLWebSocketChangeTracker
 {
     NSThread* _thread;
-    WebSocketClient* _ws;
+    PSWebSocket* _ws;
     BOOL _running;
     CFAbsoluteTime _startTime;
     int32_t _pendingMessageCount;   // How many incoming WebSocket messages haven't been parsed yet?
@@ -49,49 +51,32 @@
     if (_ws)
         return NO;
     LogTo(ChangeTracker, @"%@: Starting...", self);
-    [super start];
 
     // A WebSocket has to be opened with a GET request, not a POST (as defined in the RFC.)
     // Instead of putting the options in the POST body as with HTTP, we will send them in an
     // initial WebSocket message, in -webSocketDidOpen:, below.
-    NSURL* url = self.changesFeedURL;
-    NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL: url];
+    self.usePOST = NO;
+
+    [super start];
+
+    NSMutableURLRequest* request = [[_http URLRequest] mutableCopy];
     request.timeoutInterval = _heartbeat * 1.5;
 
-    // Add headers from my .requestHeaders property:
-    [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
-        [request setValue: value forHTTPHeaderField: key];
-        
-        if ([key caseInsensitiveCompare: @"Cookie"] == 0)
-            request.HTTPShouldHandleCookies = NO;
-    }];
-
-    if (request.HTTPShouldHandleCookies)
-        [self.cookieStorage addCookieHeaderToRequest: request];
-
-    if (_authorizer) {
-        // Let the Authorizer add its own credential:
-        NSString* authHeader = [_authorizer authorizeURLRequest: request forRealm: nil];
-        if (authHeader)
-            [request setValue: authHeader forHTTPHeaderField: @"Authorization"];
-    }
-
-    LogTo(SyncVerbose, @"%@: %@ %@", self, request.HTTPMethod, url.resourceSpecifier);
-    _ws = [[WebSocketClient alloc] initWithURLRequest: request];
+    LogTo(SyncVerbose, @"%@: %@ %@", self, request.HTTPMethod, request.URL.resourceSpecifier);
+    _ws = [PSWebSocket clientSocketWithRequest: request];
     _ws.delegate = self;
-    [_ws useTLS: self.TLSSettings];
-    NSError* error;
-    if (![_ws connect: &error]) {
-        self.error = error;
-        _ws = nil;
-        return NO;
+    NSDictionary* tls = self.TLSSettings;
+    if (tls) {
+        [_ws setStreamProperty: (__bridge CFDictionaryRef)tls
+                        forKey: (__bridge NSString*)kCFStreamPropertySSLSettings];
     }
+    [_ws open];
     _thread = [NSThread currentThread];
     _running = YES;
     _caughtUp = NO;
     _startTime = CFAbsoluteTimeGetCurrent();
     _pendingMessageCount = 0;
-    LogTo(ChangeTracker, @"%@: Started... <%@>", self, url);
+    LogTo(ChangeTracker, @"%@: Started... <%@>", self, request.URL);
     return YES;
 }
 
@@ -102,7 +87,7 @@
     if (_ws) {
         LogTo(ChangeTracker, @"%@: stop", self);
         _running = NO; // don't want to receive any more messages
-        [_ws disconnect];
+        [_ws close];
     }
     [super stop];
 }
@@ -122,29 +107,74 @@
 
 // THESE ARE CALLED ON THE WEBSOCKET'S DISPATCH QUEUE, NOT MY THREAD!!
 
-- (void) webSocket: (WebSocket*)ws didSecureWithTrust: (SecTrustRef)trust atURL:(NSURL *)url {
-    MYOnThread(_thread, ^{
-        [self checkServerTrust: trust forURL: url];
+- (BOOL)webSocket:(PSWebSocket *)webSocket validateServerTrust: (SecTrustRef)trust {
+    __block BOOL ok;
+    MYOnThreadSynchronously(_thread, ^{
+        ok = [self checkServerTrust: trust forURL: _databaseURL];
     });
+    return ok;
 }
 
-- (void) webSocketDidOpen: (WebSocket *)ws {
+- (void) webSocketDidOpen: (PSWebSocket*)ws {
     MYOnThread(_thread, ^{
         LogTo(ChangeTrackerVerbose, @"%@: WebSocket opened", self);
         _retryCount = 0;
         // Now that the WebSocket is open, send the changes-feed options (the ones that would have
         // gone in the POST body if this were HTTP-based.)
-        [ws sendBinaryMessage: self.changesFeedPOSTBody];
+        [ws send: self.changesFeedPOSTBody];
+    });
+}
+
+- (void)webSocket:(PSWebSocket *)webSocket didFailWithError:(NSError *)error {
+    MYOnThread(_thread, ^{
+        _ws = nil;
+        NSError* myError = error;
+        if ([error.domain isEqualToString: PSWebSocketErrorDomain]) {
+            if (error.code == PSWebSocketErrorCodeHandshakeFailed) {
+                // HTTP error; ask _httpLogic what to do:
+                CFHTTPMessageRef response = (__bridge CFHTTPMessageRef)error.userInfo[PSHTTPResponseErrorKey];
+                NSInteger status = CFHTTPMessageGetResponseStatusCode(response);
+                [_http receivedResponse: response];
+                if (_http.shouldRetry) {
+                    // Retry due to redirect or auth challenge:
+                    LogTo(ChangeTrackerVerbose, @"%@ got HTTP response %ld, retrying...",
+                          self, (long)status);
+                    [self retry];
+                    return;
+                }
+                // Failed, but map the error back to HTTP:
+                NSString* message = CFBridgingRelease(CFHTTPMessageCopyResponseStatusLine(response));
+                if (message.length == 0)
+                    message = error.localizedDescription;
+                NSString* urlStr = webSocket.URLRequest.URL.absoluteString;
+                myError = [NSError errorWithDomain: CBLHTTPErrorDomain
+                                              code: status
+                                          userInfo: @{NSLocalizedDescriptionKey: message,
+                                                      NSUnderlyingErrorKey: error,
+                                                      NSURLErrorFailingURLStringErrorKey: urlStr}];
+            } else {
+                // Map HTTP errors to my own error domain:
+                NSNumber* status = error.userInfo[PSHTTPStatusErrorKey];
+                if (status) {
+                    myError = CBLStatusToNSErrorWithInfo((CBLStatus)status.integerValue, nil,
+                                                       self.changesFeedURL, nil);
+                }
+            }
+        }
+        [self failedWithError: myError];
     });
 }
 
 /** Called when a WebSocket receives a textual message from its peer. */
-- (BOOL) webSocket: (WebSocket *)ws
-         didReceiveMessage: (NSString *)msg
-{
+- (void) webSocket: (PSWebSocket*)ws didReceiveMessage: (id)msg {
+    if (![msg isKindOfClass: [NSString class]]) {
+        Warn(@"Unhandled binary message");
+        [_ws closeWithCode: PSWebSocketStatusCodeUnhandledType reason: @"Unknown message"];
+        return;
+    }
     MYOnThread(_thread, ^{
         LogTo(ChangeTrackerVerbose, @"%@: Got a message: %@", self, msg);
-        if (msg.length > 0 && ws == _ws && _running) {
+        if ([msg length] > 0 && ws == _ws && _running) {
             NSData *data = [msg dataUsingEncoding: NSUTF8StringEncoding];
             BOOL parsed = [self parseBytes: data.bytes length: data.length];
             if (parsed) {
@@ -159,28 +189,38 @@
             }
             if (!parsed) {
                 Warn(@"Couldn't parse message: %@", msg);
-                [_ws closeWithCode: kWebSocketCloseDataError reason: @"Unparseable change entry"];
+                [_ws closeWithCode: PSWebSocketStatusCodeUnhandledType
+                            reason: @"Unparseable change entry"];
             }
         }
         OSAtomicDecrement32Barrier(&_pendingMessageCount);
         [self setPaused: self.paused]; // this will resume the WebSocket unless self.paused
     });
+
     // Tell the WebSocket to pause its reader if too many messages are waiting to be processed:
-    return (OSAtomicIncrement32Barrier(&_pendingMessageCount) < kMaxPendingMessages);
+    if (OSAtomicIncrement32Barrier(&_pendingMessageCount) >= kMaxPendingMessages)
+        _ws.readPaused = YES;
 }
 
 /** Called after the WebSocket closes, either intentionally or due to an error. */
-- (void) webSocket:(WebSocket *)ws
-         didCloseWithError: (NSError*)error
+- (void)webSocket:(PSWebSocket *)ws
+        didCloseWithCode:(NSInteger)code
+        reason:(NSString *)reason
+        wasClean:(BOOL)wasClean
 {
     MYOnThread(_thread, ^{
         if (ws != _ws)
             return;
         _ws = nil;
-        if (error == nil) {
+        if (wasClean && (code == PSWebSocketStatusCodeNormal || code == 0)) {
             LogTo(ChangeTracker, @"%@: closed", self);
             [self stop];
         } else {
+            NSDictionary* userInfo = $dict({NSLocalizedFailureReasonErrorKey, reason},
+                                           {NSURLErrorFailingURLStringErrorKey,
+                                               self.changesFeedURL.absoluteString});
+            NSError* error = [NSError errorWithDomain: PSWebSocketErrorDomain code: code
+                                             userInfo: userInfo];
             [self failedWithError: error];
         }
     });

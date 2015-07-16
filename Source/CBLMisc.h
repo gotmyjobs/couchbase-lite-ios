@@ -7,7 +7,10 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "CBL_Revision.h"
+
+
+/** Database sequence ID */
+typedef SInt64 SequenceNumber;
 
 
 // In a method/function implementation (not declaration), declaring an object parameter as
@@ -105,6 +108,8 @@ NSURL* CBLURLWithoutQuery( NSURL* url ) __attribute__((nonnull));
 /** Appends path components to a URL. These will NOT be URL-escaped, so you can include queries. */
 NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) __attribute__((nonnull));
 
+/** Changes a given query max key into one that also extends to any key it matches as a prefix. */
+id CBLKeyForPrefixMatch(id key, unsigned depth);
 
 #if DEBUG
 NSString* CBLPathToTestFile(NSString* name);

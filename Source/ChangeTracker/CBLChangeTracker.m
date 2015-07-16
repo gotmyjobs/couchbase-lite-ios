@@ -20,8 +20,11 @@
 #import "CBLWebSocketChangeTracker.h"
 #import "CBLChangeMatcher.h"
 #import "CBLAuthorizer.h"
+#import "CBLClientCertAuthorizer.h"
+#import "CBLCookieStorage.h"
 #import "CBLMisc.h"
 #import "CBLStatus.h"
+#import "BLIPHTTPLogic.h"
 #import "MYURLUtils.h"
 #import "WebSocket.h"
 
@@ -170,6 +173,7 @@
 - (NSDictionary*) TLSSettings {
     if (!_databaseURL.my_isHTTPS)
         return nil;
+    NSArray* clientCerts = $castIf(CBLClientCertAuthorizer, _authorizer).certificateChain;
     // Enable SSL for this connection.
     // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
     // workaround taken from Apple technote TN2287:
@@ -177,22 +181,15 @@
     // Disable automatic cert-chain checking, because that's the only way to allow self-signed
     // certs. We will check the cert later in -checkSSLCert.
     return $dict( {(id)kCFStreamSSLLevel, (id)kCFStreamSocketSecurityLevelTLSv1},
-                  {(id)kCFStreamSSLValidatesCertificateChain, @NO} );
+                  {(id)kCFStreamSSLValidatesCertificateChain, @NO},
+                  {(id)kCFStreamSSLCertificates, clientCerts});
 }
 
 
 - (BOOL) checkServerTrust: (SecTrustRef)sslTrust forURL: (NSURL*)url {
-    BOOL trusted = [_client changeTrackerApproveSSLTrust: sslTrust
+    return [_client changeTrackerApproveSSLTrust: sslTrust
                                                  forHost: url.host
                                                     port: (UInt16)url.port.intValue];
-    if (!trusted) {
-        //TODO: This error could be made more precise
-        LogTo(ChangeTracker, @"%@: Rejected server certificate", self);
-        [self failedWithError: [NSError errorWithDomain: NSURLErrorDomain
-                                                   code: NSURLErrorServerCertificateUntrusted
-                                               userInfo: nil]];
-    }
-    return trusted;
 }
 
 
@@ -210,6 +207,35 @@
 }
 
 - (BOOL) start {
+    if (!_http) {
+        // Initialize HTTPLogic before sending first request:
+        NSMutableURLRequest* urlRequest = [NSMutableURLRequest requestWithURL: self.changesFeedURL];
+        if (self.usePOST) {
+            urlRequest.HTTPMethod = @"POST";
+            urlRequest.HTTPBody = self.changesFeedPOSTBody;
+            [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
+        }
+
+        // Add headers from my .requestHeaders property:
+        [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
+            if ([key caseInsensitiveCompare: @"Cookie"] == 0)
+                urlRequest.HTTPShouldHandleCookies = NO;
+            [urlRequest setValue: value forHTTPHeaderField: key];
+        }];
+        
+        if (urlRequest.HTTPShouldHandleCookies) {
+            [self.cookieStorage addCookieHeaderToRequest: urlRequest];
+        }
+
+        // Let the Authorizer add its own headers:
+        [$castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer) authorizeURLRequest: urlRequest];
+
+        _http = [[BLIPHTTPLogic alloc] initWithURLRequest: urlRequest];
+
+        // If no credential yet, get it from authorizer if it has one:
+        if (!_http.credential)
+            _http.credential = $castIfProtocol(CBLCredentialAuthorizer, _authorizer).credential;
+    }
     self.error = nil;
     return NO;
 }
@@ -245,12 +271,6 @@
         if (code == NSURLErrorUserAuthenticationRequired)
             error = [NSError errorWithDomain: CBLHTTPErrorDomain
                                         code: kCBLStatusUnauthorized
-                                    userInfo: error.userInfo];
-    } else if ($equal(domain, WebSocketErrorDomain)) {
-        // Map HTTP errors in WebSocket domain to our HTTP domain:
-        if (code >= 300 && code <= 510)
-            error = [NSError errorWithDomain: CBLHTTPErrorDomain
-                                        code: code
                                     userInfo: error.userInfo];
     }
 
