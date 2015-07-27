@@ -12,13 +12,16 @@
 #import "CBLManager+Internal.h"
 
 
-#define kPort 59999
 #define kListenerDBName @"listy"
 #define kNDocuments 100
 #define kMinAttachmentLength   4000
 #define kMaxAttachmentLength 100000
 
 #define USE_AUTH 1
+#define USE_SSL  1
+
+
+static UInt16 sPort = 60100;
 
 
 @interface P2P_HTTP_Tests : CBLTestCaseWithDB
@@ -49,16 +52,24 @@
     dbmgr.replicatorClassName = self.replicatorClassName;
 
     listenerDB = [dbmgr databaseNamed: kListenerDBName error: NULL];
-    listenerDBURL = [NSURL URLWithString: $sprintf(@"http://localhost:%d/%@", kPort, kListenerDBName)];
 
-    listener = [[[self listenerClass] alloc] initWithManager: dbmgr port: kPort];
+    listener = [[[self listenerClass] alloc] initWithManager: dbmgr port: sPort];
 #if USE_AUTH
     listener.requiresAuth = YES;
     listener.passwords = @{@"bob": @"slack"};
 #endif
 
+#if USE_SSL
+    NSError* error;
+    Assert([listener setAnonymousSSLIdentityWithLabel: @"CBLUnitTests" error: &error],
+           @"Failed to set SSL identity: %@", error);
+#endif
+
+    listenerDBURL = [listener.URL URLByAppendingPathComponent: listenerDB.name];
+    Log(@"'Remote' db URL = <%@>", listenerDBURL);
+
     // Wait for listener to start:
-    [self keyValueObservingExpectationForObject: listener keyPath: @"port" expectedValue: @(kPort)];
+    [self keyValueObservingExpectationForObject: listener keyPath: @"port" expectedValue: @(sPort)];
     [listener start: NULL];
     [self waitForExpectationsWithTimeout: 5.0 handler: nil];
 }
@@ -66,6 +77,11 @@
 
 - (void) tearDown {
     [listener stop];
+    // Each test run uses a different port number (sPort is incremented) to prevent CFNetwork from
+    // resuming the previous SSL session. Because if it does that, the previous client cert gets
+    // used on the server side, which breaks the test. Haven't found a workaround for this yet.
+    // --Jens 7/2015
+    ++sPort;
     [super tearDown];
 }
 
@@ -151,17 +167,25 @@
                                                              password: @"slack"];
 #endif
     [repl start];
+
     __block bool started = false;
     [self expectationForNotification: kCBLReplicationChangeNotification object: repl
-                             handler: ^BOOL(NSNotification *n) {
-                                 Log(@"Repl running=%d, status=%d", repl.running, repl.status);
-                                 if (repl.running)
-                                     started = true;
-                                 if (repl.lastError)
-                                     return true;
-                                 return started && (repl.status == kCBLReplicationStopped ||
-                                                    repl.status == kCBLReplicationIdle);
-                             }];
+         handler: ^BOOL(NSNotification *n) {
+             Log(@"Repl running=%d, status=%d", repl.running, repl.status);
+             if (repl.running)
+                 started = true;
+             if (repl.lastError)
+                 return true;
+             if (repl.status == kCBLReplicationStopped)
+                 NSLog(@"Stop");
+             return started && (repl.status == kCBLReplicationStopped ||
+                                repl.status == kCBLReplicationIdle);
+         }];
+
+    if ([listener respondsToSelector:@selector(connectionCount)]) // observe for changes:
+        [self keyValueObservingExpectationForObject: listener
+                                            keyPath: @"connectionCount" expectedValue: @0];
+
     [self waitForExpectationsWithTimeout: 30.0 handler: nil];
     AssertNil(repl.lastError);
     if (expectedChangesCount > 0) {
@@ -197,9 +221,6 @@
          expectedChangesCount: (NSUInteger)expectedChangesCount
 {
     [super runReplication: repl expectedChangesCount: expectedChangesCount];
-    // Wait for the listener-side connection to finish:
-    [self keyValueObservingExpectationForObject: listener keyPath: @"connectionCount" expectedValue: @0];
-    [self waitForExpectationsWithTimeout: 5.0 handler: nil];
 }
 
 @end
