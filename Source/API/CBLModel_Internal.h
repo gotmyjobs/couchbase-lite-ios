@@ -28,7 +28,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (readonly) NSDictionary* currentProperties;
 
 - (instancetype) initWithDocument: (nullable CBLDocument*)document
-                       orDatabase: (nullable CBLDatabase*)database NS_DESIGNATED_INITIALIZER;
+                       orDatabase: (nullable CBLDatabase*)database;
 
 - (id) getValueOfProperty: (NSString*)property ofClass: (Class)klass;
 - (void) cacheValue: (id)value ofProperty: (NSString*)property changed: (BOOL)changed;

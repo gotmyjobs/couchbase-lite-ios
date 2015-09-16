@@ -29,7 +29,6 @@
 
 @dynamic type;
 
-
 - (instancetype) initWithDocument: (nullable CBLDocument*)document
                        orDatabase: (nullable CBLDatabase*)database
 {
