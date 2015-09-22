@@ -135,9 +135,7 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 
 static void catchInBlock(void (^block)()) {
-    @try {
-        block();
-    }catchAndReport(@"-[CBLDatabase doAsync:]");
+	block();
 }
 
 
