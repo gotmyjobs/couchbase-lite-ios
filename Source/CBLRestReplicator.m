@@ -113,7 +113,8 @@
         _sessionID = [$sprintf(@"repl%03d", ++sLastSessionID) copy];
 #if TARGET_OS_IPHONE
         // Keeps static analyzer from complaining this ivar is unused:
-        _bgTask = 0;
+        _bgMonitor = nil;
+        _hasBGTask = NO;
 #endif
     }
     return self;
@@ -246,6 +247,7 @@
     CBLDatabase* db = _db;
     Assert(db, @"Can't restart an already stopped CBL_Replicator");
     LogTo(Sync, @"%@ STARTING ...", self);
+    LogTo(SyncPerf, @"%@ STARTING ...", self);
 
     [db addActiveReplicator: self];
 
@@ -325,6 +327,7 @@
 
 - (void) stopped {
     LogTo(Sync, @"%@ STOPPED", self);
+    LogTo(SyncPerf, @"%@ STOPPED", self);
     Log(@"Replication: %@ took %.3f sec; error=%@",
         self, CFAbsoluteTimeGetCurrent()-_startTime, _error);
 #if TARGET_OS_IPHONE
@@ -481,14 +484,17 @@
 #endif
             if (!_settings.continuous) {
                 [self stopped];
-            } else if (_error) /*(_revisionsFailed > 0)*/ {
-                LogTo(Sync, @"%@: Failed to xfer %u revisions; will retry in %g sec",
-                      self, _revisionsFailed, kRetryDelay);
-                [NSObject cancelPreviousPerformRequestsWithTarget: self
-                                                         selector: @selector(retryIfReady)
-                                                           object: nil];
-                [self performSelector: @selector(retryIfReady)
-                           withObject: nil afterDelay: kRetryDelay];
+            } else {
+                LogTo(SyncPerf, @"%@ is now inactive", self);
+                if (_error) /*(_revisionsFailed > 0)*/ {
+                    LogTo(Sync, @"%@: Failed to xfer %u revisions; will retry in %g sec",
+                          self, _revisionsFailed, kRetryDelay);
+                    [NSObject cancelPreviousPerformRequestsWithTarget: self
+                                                             selector: @selector(retryIfReady)
+                                                               object: nil];
+                    [self performSelector: @selector(retryIfReady)
+                               withObject: nil afterDelay: kRetryDelay];
+                }
             }
         }
     }
@@ -703,8 +709,10 @@
 }
 
 - (void) removeRemoteRequest: (CBLRemoteRequest*)request {
-    if (!_serverType)
-        _serverType = request.responseHeaders[@"X-Sync-Server"];
+    if (!_serverType) {
+        _serverType = request.responseHeaders[@"Server"];
+        LogTo(Sync, @"%@: Server is %@", self, _serverType);
+    }
     [_remoteRequests removeObjectIdenticalTo: request];
 }
 
@@ -757,13 +765,18 @@
 }
 
 
+// If the local database has been copied from one pre-packaged in the app, this method returns
+// a pre-existing checkpointed sequence to start from. This allows first-time replication to be
+// fast and avoid starting over from sequence zero.
 - (NSString*) getLastSequenceFromLocalCheckpointDocument {
     CBLDatabase* strongDb = _db;
     NSDictionary* doc = [strongDb getLocalCheckpointDocument];
     if (doc) {
-        NSString* checkpointID = [_settings remoteCheckpointDocIDForLocalUUID:
-                                  doc[kCBLDatabaseLocalCheckpoint_LocalUUID]];
-        return [strongDb lastSequenceWithCheckpointID: checkpointID];
+        NSString* localUUID = doc[kCBLDatabaseLocalCheckpoint_LocalUUID];
+        if (localUUID) {
+            NSString* checkpointID = [_settings remoteCheckpointDocIDForLocalUUID: localUUID];
+            return [strongDb lastSequenceWithCheckpointID: checkpointID];
+        }
     }
     return nil;
 }
@@ -773,7 +786,15 @@
     _lastSequenceChanged = NO;
     NSString* checkpointID = self.remoteCheckpointDocID;
     NSString* localLastSequence = [_db lastSequenceWithCheckpointID: checkpointID];
+
+    if (!localLastSequence && ![self getLastSequenceFromLocalCheckpointDocument]) {
+        LogTo(Sync, @"%@: No local checkpoint; not getting remote one", self);
+        [self maybeCreateRemoteDB];
+        [self beginReplicating];
+        return;
+    }
     
+    LogTo(SyncPerf, @"%@ Getting remote checkpoint", self);
     [self asyncTaskStarted];
     CBLRemoteJSONRequest* request = 
         [self sendAsyncRequest: @"GET"
@@ -781,6 +802,7 @@
                           body: nil
                   onCompletion: ^(id response, NSError* error) {
                   // Got the response:
+                  LogTo(SyncPerf, @"%@ Got remote checkpoint", self);
                   if (error && error.code != kCBLStatusNotFound) {
                       LogTo(Sync, @"%@: Error fetching last sequence: %@",
                             self, error.localizedDescription);

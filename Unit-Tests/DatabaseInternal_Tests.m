@@ -22,7 +22,7 @@
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
 #import "CouchbaseLitePrivate.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
 
 
 static NSDictionary* userProperties(NSDictionary* dict) {
@@ -901,7 +901,10 @@ static CBL_Revision* mkrev(NSString* revID) {
         NSString* absPath = [dir stringByAppendingPathComponent: path];
         id prot = [[fmgr attributesOfItemAtPath: absPath error: nil] objectForKey: NSFileProtectionKey];
         Log(@"Protection of %@ --> %@", path, prot);
-        AssertEqual(prot, NSFileProtectionCompleteUnlessOpen);
+        // Not checking -shm file as it will have NSFileProtectionNone by default regardless of its
+        // parent directory projection level. However, the -shm file contains non-sensitive information.
+        if (![path hasSuffix:@"-shm"])
+            AssertEqual(prot, NSFileProtectionCompleteUnlessOpen);
     }
 }
 #endif
@@ -946,6 +949,16 @@ static CBL_Revision* mkrev(NSString* revID) {
     history = @[rev.revID];
     AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
 
+    // Create another new doc with a merged conflict:
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID2" revID: @"1-1111" deleted: NO];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+    rev = [[CBL_MutableRevision alloc] initWithDocID: @"MyDocID2" revID: @"1-ffff" deleted: YES];
+    rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID});
+    history = @[rev.revID];
+    AssertEq([db forceInsert: rev revisionHistory: history source: nil error: &error], 201);
+
     // Get changes, testing all combinations of includeConflicts and includeDocs:
     for (int conflicts=0; conflicts <= 1; conflicts++) {
         for (int bodies=0; bodies <= 1; bodies++) {
@@ -954,15 +967,40 @@ static CBL_Revision* mkrev(NSString* revID) {
             options.includeDocs = (BOOL)bodies;
             CBLStatus status;
             CBL_RevisionList* changes = [db changesSinceSequence: 0 options: &options filter: NULL params: nil status: &status];
-            AssertEq(changes.count, 11u + conflicts);
+            AssertEq(changes.count, 12u + 2*conflicts);
             for (CBL_Revision* change in changes) {
                 if (bodies)
                     Assert(change.body != nil);
                 else
                     AssertNil(change.body);
             }
+
+            if (!conflicts) {
+                AssertEqual(changes[10].revID, @"1-ffff");
+                AssertEqual(changes[11].revID, @"1-1111"); // Non-deleted rev should be current (#896)
+            }
         }
     }
+}
+
+
+// Ensure that a database created without auto-compact (by CBL 1.1, or prior to 10/5/15) can
+// stil be opened, since it has to be switched to auto-compact mode.
+- (void) test28_enableAutoCompact {
+    __block NSError* error;
+    [CBLDatabase setAutoCompact: NO];
+    __block CBLDatabase* manualDB = [dbmgr databaseNamed: @"manualcompact" error: &error];
+    Assert(manualDB);
+    [self createDocumentWithProperties: @{} inDatabase: manualDB];
+    Assert([manualDB close: &error]);
+    manualDB = nil;
+
+    [CBLDatabase setAutoCompact: YES];
+    [self allowWarningsIn:^{
+        manualDB = [dbmgr databaseNamed: @"manualcompact" error: &error];
+    }];
+    Assert(manualDB);
+    [manualDB close: &error];
 }
 
 @end

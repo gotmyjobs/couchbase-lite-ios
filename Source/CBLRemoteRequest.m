@@ -25,7 +25,7 @@
 #import "Logging.h"
 #import "Test.h"
 #import "MYURLUtils.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
 #import "CBLCookieStorage.h"
 
 
@@ -46,11 +46,15 @@ typedef enum {
 @implementation CBLRemoteRequest
 {
     AuthPhase _authPhase;
+    NSURLCredential* _proposedCredential;
 }
 
 
 @synthesize delegate=_delegate, responseHeaders=_responseHeaders, cookieStorage=_cookieStorage;
 @synthesize autoRetry = _autoRetry;
+#if DEBUG
+@synthesize debugAlwaysTrust=_debugAlwaysTrust;
+#endif
 
 
 - (instancetype) initWithMethod: (NSString*)method
@@ -123,7 +127,7 @@ typedef enum {
     NSData* body = _request.HTTPBody;
     if (body.length < 100 || [_request valueForHTTPHeaderField: @"Content-Encoding"] != nil)
         return NO;
-    NSData* encoded = [NSData gtm_dataByGzippingData: body];
+    NSData* encoded = [CBLGZip dataByCompressingData: body];
     if (encoded.length >= body.length)
         return NO;
     _request.HTTPBody = encoded;
@@ -150,9 +154,7 @@ typedef enum {
 
 - (void) clearConnection {
     _request = nil;
-    if (_connection) {
-        _connection = nil;
-    }
+    _connection = nil;
 }
 
 
@@ -247,10 +249,12 @@ typedef enum {
     do {
         switch (++_authPhase) {
             case kTryAuthorizer:
+                _proposedCredential = challenge.proposedCredential;
                 cred = $castIf(CBLPasswordAuthorizer, _authorizer).credential;
                 break;
             case kTryProposed:
-                cred = challenge.proposedCredential;
+                cred = _proposedCredential;
+                _proposedCredential = nil;
                 break;
             case kFindCredential: {
                 NSURLProtectionSpace* space = challenge.protectionSpace;
@@ -261,7 +265,7 @@ typedef enum {
             default:
                 return nil; // give up
         }
-    } while (cred == nil);
+    } while (cred == nil || (cred.user && !cred.hasPassword));
     return cred;
 }
 
@@ -327,6 +331,16 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
             SecTrustResultType result;
             ok = (SecTrustEvaluate(trust, &result) == noErr) &&
                     (result==kSecTrustResultProceed || result==kSecTrustResultUnspecified);
+#if DEBUG
+            if (!ok && _debugAlwaysTrust) {
+                ok = YES;
+                CFDataRef exception = SecTrustCopyExceptions(trust);
+                if (exception) {
+                    SecTrustSetExceptions(trust, exception);
+                    CFRelease(exception);
+                }
+            }
+#endif
         }
         if (ok) {
             LogTo(RemoteRequest, @"    useCredential for trust: %@", trust);

@@ -118,6 +118,8 @@
     AssertEq(status, kCBLStatusCreated);
     AssertNil(error);
 #pragma unused(rev2)
+
+    [self createDocuments: 100];
     
     // Push them to the remote:
     NSURL* remoteDB = [self remoteTestDBURL: kScratchDBName];
@@ -125,8 +127,8 @@
         return;
     [self eraseRemoteDB: remoteDB];
     id lastSeq = replic8(db, remoteDB, YES, @"filter", nil, nil);
-    AssertEq([lastSeq intValue], 3);
-    AssertEq(filterCalls, 2);
+    AssertEq([lastSeq intValue], 103);
+    AssertEq(filterCalls, 102);
 }
 
 
@@ -137,15 +139,15 @@
         return;
 
     id lastSeq = replic8(db, remoteURL, NO, nil, nil, nil);
-    AssertEqual(lastSeq, @3);
+    AssertEqual(lastSeq, @103);
     
-    AssertEq(db.documentCount, 2u);
-    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 3 : 2));
+    AssertEq(db.documentCount, 102u);
+    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 103 : 102));
     
     // Replicate again; should complete but add no revisions:
     Log(@"Second replication, should get no more revs:");
     replic8(db, ([self remoteTestDBURL: kScratchDBName]), NO, nil, nil, nil);
-    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 3 : 2));
+    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 103 : 102));
     
     CBL_Revision* doc = [db getDocumentWithID: @"doc1" revisionID: nil];
     Assert(doc);
@@ -166,15 +168,15 @@
         return;
 
     id lastSeq = replic8Continuous(db, remoteURL, NO, nil, nil, nil);
-    AssertEqual(lastSeq, @3);
+    AssertEqual(lastSeq, @103);
 
-    AssertEq(db.documentCount, 2u);
-    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 3 : 2));
+    AssertEq(db.documentCount, 102u);
+    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 103 : 102));
 
     // Replicate again; should complete but add no revisions:
     Log(@"Second replication, should get no more revs:");
     replic8Continuous(db, remoteURL, NO, nil, nil, nil);
-    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 3 : 2));
+    AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 103 : 102));
 
     CBL_Revision* doc = [db getDocumentWithID: @"doc1" revisionID: nil];
     Assert(doc);
@@ -228,12 +230,12 @@
                                       beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.5]])
             break;
     }
-    Assert(repl.status == kCBLReplicatorStopped);
+    AssertEq(repl.status, kCBLReplicatorStopped);
     Assert(!repl.savingCheckpoint);
     AssertNil(repl.error);
     Log(@"...replicator finished. lastSequence=%@", repl.lastSequence);
     id lastSeq = repl.lastSequence;
-    AssertEqual(lastSeq, @3);
+    AssertEqual(lastSeq, @103);
 
     AssertEq(db.documentCount, 1u);
     AssertEq(db.lastSequenceNumber, (self.isSQLiteDB ? 2 : 1));
@@ -271,6 +273,7 @@
         return;
 
     Log(@"Replicating without root cert; should fail...");
+    CBLSetAnchorCerts(nil, NO);
     [self allowWarningsIn:^{
         replic8(db, remoteURL, NO, nil, nil,
                 ([NSError errorWithDomain: NSURLErrorDomain
@@ -298,6 +301,7 @@
         return;
 
     Log(@"Replicating without root cert; should fail...");
+    CBLSetAnchorCerts(nil, NO);
     [self allowWarningsIn:^{
         replic8Continuous(db, remoteURL, NO, nil, nil,
                           [NSError errorWithDomain: NSURLErrorDomain
@@ -335,7 +339,7 @@
     }];
 
     Log(@"Now replicating with correct pinned cert...");
-    NSString* digest = @"c745fbfc03382125271daffc2e715a5b0172d1d8";
+    NSString* digest = CBLHexSHA1Digest([self contentsOfTestFile: @"SelfSigned.cer"]);
     id lastSeq = replic8Continuous(db, remoteURL, NO, nil,
                                    @{kCBLReplicatorOption_PinnedCert: digest},
                                    nil);
@@ -348,7 +352,7 @@
 
 - (void) test_09_Pusher_NonExistentServer {
     RequireTestCase(Pusher);
-    NSURL* remoteURL = [NSURL URLWithString:@"http://mylocalhost/db"];
+    NSURL* remoteURL = [NSURL URLWithString:@"https://mylocalhost/db"];
     if (!remoteURL) {
         Warn(@"Skipping test CBL_Pusher_NonExistentServer: invalid URL");
         return;
@@ -361,7 +365,7 @@
 
 - (void) test_10_Puller_NonExistentServer {
     RequireTestCase(Puller);
-    NSURL* remoteURL = [NSURL URLWithString:@"http://mylocalhost/db"];
+    NSURL* remoteURL = [NSURL URLWithString:@"https://mylocalhost/db"];
     if (!remoteURL) {
         Warn(@"Skipping test CBL_Puller_NonExistentServer: invalid URL");
         return;
@@ -398,7 +402,7 @@
                                       beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.5]])
             break;
     }
-    Assert(repl.status == kCBLReplicatorStopped);
+    AssertEq(repl.status, kCBLReplicatorStopped);
     Assert(!repl.savingCheckpoint);
     AssertNil(repl.error);
     Log(@"...replicator finished. lastSequence=%@", repl.lastSequence);
@@ -684,10 +688,9 @@
             break;
         }
     }
-    Assert(repl.status == kCBLReplicatorStopped);
+    AssertEq(repl.status, kCBLReplicatorStopped);
     Assert(!repl.savingCheckpoint);
     if (expectError) {
-        Assert(repl.status == kCBLReplicatorStopped);
         Assert($equal(repl.error.domain, expectError.domain) && repl.error.code == expectError.code,
                @"\nUnexpected error %@\n  Expected error %@", repl.error, expectError);
         Log(@"...replicator got expected error %@", repl.error);

@@ -18,7 +18,7 @@
 
 #import "CBLDatabase+Attachments.h"
 #import "CBL_Attachment.h"
-#import "CBL_BlobStore.h"
+#import "CBL_BlobStoreWriter.h"
 #import "CBLInternal.h"
 
 
@@ -98,6 +98,12 @@
 }
 
 
+- (UInt64) encodedLength {
+    NSNumber* lengthObj = $castIf(NSNumber, _metadata[@"encoded_length"] ?: _metadata[@"length"]);
+    return lengthObj ? [lengthObj longLongValue] : 0;
+}
+
+
 #pragma mark - BODY
 
 
@@ -109,6 +115,16 @@
 
 - (NSData*) bodyIfNew {
     return _body ? self.content : nil;
+}
+
+
+- (BOOL) contentAvailable {
+    if (_body) {
+        return ([_body isKindOfClass: [NSData class]] ||
+                ([_body isKindOfClass: [NSURL class]] && [_body isFileURL]));
+    } else {
+        return self._internalAttachment.hasContent;
+    }
 }
 
 
@@ -151,6 +167,14 @@
     }
     [stream open];
     return stream;
+}
+
+
+- (BOOL) purge {
+    CBLBlobKey key;
+    return !_body
+        && [CBL_Attachment digest: _metadata[@"digest"] toBlobKey: &key]
+        && [_rev.database.attachmentStore deleteBlobForKey: key];
 }
 
 

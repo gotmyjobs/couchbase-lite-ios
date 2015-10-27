@@ -38,6 +38,7 @@
         if (document) {
             LogTo(CBLModel, @"%@ initWithDocument: %@ @%p", self.class, document, document);
             self.document = document;
+            _isNew = (document.currentRevisionID == nil);
             [self didLoadFromDocument];
         } else {
             LogTo(CBLModel, @"%@ initWithDatabase: %@", self.class, database);
@@ -99,6 +100,14 @@
                 self.class, CBLAbbreviate(self.document.documentID)];
 }
 
+
+- (id) debugQuickLookObject {
+    NSDictionary* props = [self propertiesToSave];
+    return $sprintf(@"%@ %@",
+                    [self class],
+                    [CBLJSON stringWithJSONObject: props options: CBLJSONWritingPrettyPrinted
+                                            error: NULL]);
+}
 
 #pragma mark - DOCUMENT / DATABASE:
 

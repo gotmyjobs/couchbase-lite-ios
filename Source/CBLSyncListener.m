@@ -9,6 +9,7 @@
 #import "CBLSyncListener.h"
 #import "CBLListener+Internal.h"
 #import "CBLSyncConnection.h"
+#import "BLIPRequest.h"
 #import "CouchbaseLite.h"
 #import "CBLInternal.h"
 #import "BLIPPocketSocketListener.h"
@@ -89,6 +90,14 @@
         CBLSyncConnection* handler = [[CBLSyncConnection alloc] initWithDatabase: db
                                                                       connection: connection
                                                                            queue: queue];
+        if (_facade.readOnly) {
+            handler.onSyncAccessCheck = ^CBLStatus(BLIPRequest* request) {
+                NSString* profile = request.profile;
+                if ([profile isEqualToString:@"changes"] || [profile isEqualToString:@"rev"])
+                    return kCBLStatusForbidden;
+                return kCBLStatusOK;
+            };
+        }
         [handler addObserver: self forKeyPath: @"state" options: 0 context: (void*)1];
         dispatch_sync(_queue, ^{
             [_handlers addObject: handler];

@@ -23,7 +23,7 @@ typedef enum {
 } CBLViewCollation;
 
 
-BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions* options);
+BOOL CBLQueryRowValueIsEntireDoc(id value);
 
 
 @interface CBLView () <CBL_ViewStorageDelegate>
@@ -97,6 +97,9 @@ BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions
                              view: (CBLView*)view
                    sequenceNumber: (SequenceNumber)sequenceNumber
                              rows: (NSArray*)rows;
+- (void) sortUsingDescriptors: (NSArray*)sortDescriptors
+                         skip: (NSUInteger)skip
+                        limit: (NSUInteger)limit;
 @end
 
 

@@ -27,6 +27,7 @@
 #import "CBL_Shared.h"
 #import "CBLMisc.h"
 #import "CBLDatabase.h"
+#import "CBLDatabaseUpgrade.h"
 #import "CouchbaseLitePrivate.h"
 
 #import "MYBlockUtils.h"
@@ -93,7 +94,6 @@ static BOOL sAutoCompact = YES;
 
 #if DEBUG
 + (instancetype) createEmptyDBAtPath: (NSString*)dir {
-    [self setAutoCompact: NO]; // unit tests don't want autocompact
     if (![self deleteDatabaseFilesAtPath: dir error: NULL])
         return nil;
     CBLDatabase *db = [[self alloc] initWithDir: dir name: nil manager: nil readOnly: NO];
@@ -155,28 +155,49 @@ static BOOL sAutoCompact = YES;
     NSString* storageType = _manager.storageType ?: @"SQLite";
     NSString* storageClassName = $sprintf(@"CBL_%@Storage", storageType);
     Class primaryStorage = NSClassFromString(storageClassName);
-    Assert(primaryStorage, @"CBLManager.storageType is '%@' but no %@ class found",
+    Assert(primaryStorage, @"CBLManager.storageType is '%@' but no %@ class found, maybe add the -ObjC flag to Other Linker Flags in Build Settings",
            _manager.storageType, storageClassName);
     Assert([primaryStorage conformsToProtocol: @protocol(CBL_Storage)],
             @"CBLManager.storageType is '%@' but %@ is not a CBL_Storage implementation",
             _manager.storageType, storageClassName);
+
+    id<CBL_Storage> storage;
+    BOOL upgrade = NO;
+
+    if (_manager.upgradeStorage) {
+        // If upgrading, always use primary storage type, and check for SQL db:
+        storage = [[primaryStorage alloc] init];
+        if (![storageType isEqualToString: @"SQLite"]) {
+            NSString* sqlitePath = [_dir stringByAppendingPathComponent: @"db.sqlite3"];
+            upgrade = [[NSFileManager defaultManager] fileExistsAtPath: sqlitePath]
+                        && ![storage databaseExistsIn: _dir];
+        }
+    } else {
+        // Use primary unless dir already contains a db created by secondary:
     Class secondaryStorage = NSClassFromString(@"CBL_ForestDBStorage");
     if (primaryStorage == secondaryStorage)
         secondaryStorage = NSClassFromString(@"CBL_SQLiteStorage");
-    // Use primary unless dir already contains a db created by secondary:
-    id<CBL_Storage> storage = [[secondaryStorage alloc] init];
-    if (![storage databaseExistsIn: _dir])
+        storage = [[secondaryStorage alloc] init];
+        if (!storage || ![storage databaseExistsIn: _dir])
         storage = [[primaryStorage alloc] init];
+    }
+
     LogTo(CBLDatabase, @"Using %@ for db at %@", [storage class], _dir);
 
     _storage = storage;
     _storage.delegate = self;
+    _storage.autoCompact = sAutoCompact;
+
+    CBLSymmetricKey* encryptionKey = [_manager.shared valueForType: @"encryptionKey"
+                                                              name: @"" inDatabaseNamed: _name];
+    if ([_storage respondsToSelector: @selector(setEncryptionKey:)])
+        [_storage setEncryptionKey: encryptionKey];
+
     if (![_storage openInDirectory: _dir
                           readOnly: _readOnly
                            manager: _manager
                              error: outError])
         return NO;
-    _storage.autoCompact = sAutoCompact;
 
     // First-time setup:
     if (!self.privateUUID) {
@@ -188,7 +209,9 @@ static BOOL sAutoCompact = YES;
 
     // Open attachment store:
     NSString* attachmentsPath = self.attachmentStorePath;
-    _attachments = [[CBL_BlobStore alloc] initWithPath: attachmentsPath error: outError];
+    _attachments = [[CBL_BlobStore alloc] initWithPath: attachmentsPath
+                                         encryptionKey: encryptionKey
+                                                 error: outError];
     if (!_attachments) {
         Warn(@"%@: Couldn't open attachment store at %@", self, attachmentsPath);
         [_storage close];
@@ -196,7 +219,9 @@ static BOOL sAutoCompact = YES;
         return NO;
     }
 
+    [self willChangeValueForKey: @"isOpen"];
     _isOpen = YES;
+    [self didChangeValueForKey: @"isOpen"];
 
     // Listen for _any_ CBLDatabase changing, so I can detect changes made to my database
     // file by other instances (running on other threads presumably.)
@@ -208,6 +233,29 @@ static BOOL sAutoCompact = YES;
                                              selector: @selector(dbChanged:)
                                                  name: CBL_DatabaseWillBeDeletedNotification
                                                object: nil];
+
+    if (upgrade) {
+        // Upgrading a SQLite database:
+        Class databaseUpgradeClass = NSClassFromString(@"CBLDatabaseUpgrade");
+        if (databaseUpgradeClass) {
+            NSString* dbPath = [_dir stringByAppendingPathComponent: @"db.sqlite3"];
+            Log(@"%@: Upgrading to %@ ...", self, storageType);
+            CBLDatabaseUpgrade* upgrader = [[databaseUpgradeClass alloc] initWithDatabase: self
+                                                                               sqliteFile: dbPath];
+            CBLStatus status = [upgrader import];
+            if (CBLStatusIsError(status)) {
+                Warn(@"Upgrade failed: status %d", status);
+                [upgrader backOut];
+                [self _close];
+                return CBLStatusToOutNSError(status, outError);
+            } else {
+                [upgrader deleteSQLiteFiles];
+            }
+        } else {
+            Warn(@"Upgrade skipped: Database upgrading class is not present.");
+        }
+    }
+
     return YES;
 }
 
@@ -241,7 +289,9 @@ static BOOL sAutoCompact = YES;
         _storage = nil;
         _attachments = nil;
 
+        [self willChangeValueForKey: @"isOpen"];
         _isOpen = NO;
+        [self didChangeValueForKey: @"isOpen"];
 
         [[NSNotificationCenter defaultCenter] removeObserver: self];
         [self _clearDocumentCache];
@@ -266,11 +316,6 @@ static BOOL sAutoCompact = YES;
 
 - (NSString*) publicUUID {
     return [_storage infoForKey: @"publicUUID"];
-}
-
-
-- (CBLSymmetricKey*) encryptionKey {
-    return [_manager.shared valueForType: @"encryptionKey" name: @"" inDatabaseNamed: _name];
 }
 
 

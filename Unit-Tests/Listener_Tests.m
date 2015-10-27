@@ -12,7 +12,7 @@
 #import "CBLHTTPListener.h"
 #import "CBLRemoteRequest.h"
 #import "CBLClientCertAuthorizer.h"
-#import "BLIPPocketSocketConnection.h"
+#import "BLIP.h"
 #import "MYAnonymousIdentity.h"
 
 #import <arpa/inet.h>
@@ -52,6 +52,12 @@ static UInt16 sPort = 60000;
     // --Jens 7/2015
     listener = [[[self listenerClass] alloc] initWithManager: dbmgr port: sPort];
     listener.delegate = self;
+    // Need to register a Bonjour service, otherwise on an iOS device the listener's URL doesn't
+    // work because the .local hostname hasn't been registered over mDNS.
+    [listener setBonjourName: @"CBL Unit Tests" type: @"_cblunittests._tcp"];
+
+    if (self.iOSVersion >= 9)
+        [self enableSSL];
 }
 
 - (void)tearDown {
@@ -62,37 +68,42 @@ static UInt16 sPort = 60000;
 }
 
 
-- (void)testSSL_NoClientCert {
-    if (!self.isSQLiteDB)
-        return;
-    NSError* error;
-    Assert([listener setAnonymousSSLIdentityWithLabel: @"CBLUnitTests" error: &error],
-           @"Failed to set SSL identity: %@", error);
-    // Wait for listener to start:
+- (void) enableSSL {
+    if (!listener.SSLIdentity) {
+        NSError* error;
+        Assert([listener setAnonymousSSLIdentityWithLabel: @"CBLUnitTests" error: &error],
+               @"Failed to set SSL identity: %@", error);
+    }
+}
+
+- (void) startListener {
     if (listener.port == 0) {
-        [self keyValueObservingExpectationForObject: listener keyPath: @"port" expectedValue: @(sPort)];
+        [self keyValueObservingExpectationForObject: listener
+                                            keyPath: @"port"
+                                      expectedValue: @(sPort)];
         [listener start: NULL];
         [self waitForExpectationsWithTimeout: kTimeout handler: nil];
     }
+}
 
+
+- (void)test01_SSL_NoClientCert {
+    if (!self.isSQLiteDB)
+        return;
+    [self enableSSL];
+    [self startListener];
     _expectAuthenticateTrust = [self expectationWithDescription: @"authenticateWithTrust"];
     [self connect];
 }
 
 
-- (void)testSSL_ClientCert {
+- (void)test02_SSL_ClientCert {
     if (!self.isSQLiteDB)
         return;
-    NSError* error;
-    Assert([listener setAnonymousSSLIdentityWithLabel: @"CBLUnitTests" error: &error],
-           @"Failed to set SSL identity: %@", error);
-    // Wait for listener to start:
-    if (listener.port == 0) {
-        [self keyValueObservingExpectationForObject: listener keyPath: @"port" expectedValue: @(sPort)];
-        [listener start: NULL];
-        [self waitForExpectationsWithTimeout: kTimeout handler: nil];
-    }
+    [self enableSSL];
+    [self startListener];
 
+    NSError* error;
     SecIdentityRef identity = MYGetOrCreateAnonymousIdentity(@"CBLUnitTests-Client",
                                                      kMYAnonymousIdentityDefaultExpirationInterval,
                                                      &error);
@@ -104,11 +115,102 @@ static UInt16 sPort = 60000;
     [self connect];
 }
 
+- (void)test03_ReadOnly {
+    if (!self.isSQLiteDB || ![listener isKindOfClass: [CBLSyncListener class]])
+        return;
+
+    // Enable readOnly mode:
+    listener.readOnly = YES;
+
+    [self startListener];
+
+    NSURL* url = self.listenerSyncURL;
+    Log(@"Connecting to <%@>", url);
+    BLIPPocketSocketConnection* conn = [[BLIPPocketSocketConnection alloc] initWithURL: url];
+    [conn setDelegate: self queue: dispatch_get_main_queue()];
+
+    NSError* error;
+    Assert([conn connect: &error], @"Can't connect: %@", error);
+    _expectDidOpen = [self expectationWithDescription: @"didOpen"];
+    [self waitForExpectationsWithTimeout: kTimeout handler: nil];
+
+    // getCheckpoint:
+    BLIPRequest* request = [conn request];
+    request.profile = @"getCheckpoint";
+    request[@"client"] = @"TestReadOnly";
+    [self sendRequest: request expectedErrorCode: 0 expectedResult: nil];
+
+    // setCheckpoint:
+    request = [conn request];
+    request.profile = @"setCheckpoint";
+    request[@"client"] = @"TestReadOnly";
+    request[@"rev"] = @"1-000";
+    request.bodyJSON = $dict({@"lastSequence", @(1)});
+    [self sendRequest: request expectedErrorCode: 0 expectedResult: nil];
+
+    // subChanges:
+    request = [conn request];
+    request.profile = @"subChanges";
+    [self sendRequest: request expectedErrorCode: 0 expectedResult: nil];
+
+    // changes:
+    request = [conn request];
+    request.profile = @"changes";
+    request.bodyJSON = @[@[@(1), @"doc1", @"1-001"]];
+    [self sendRequest: request expectedErrorCode: 403 expectedResult: nil];
+
+    // rev:
+    request = [conn request];
+    request.profile = @"rev";
+    request[@"history"] = @"1-001";
+    request.bodyJSON = @{@"_id": @"doc1", @"_rev": @"1-001"};
+    [self sendRequest: request expectedErrorCode: 403 expectedResult: nil];
+
+    // getAttachment:
+    CBLUnsavedRevision* newRev =[[db createDocument] newRevision];
+    NSData* body = [@"This is an attachment." dataUsingEncoding: NSUTF8StringEncoding];
+    [newRev setAttachmentNamed: @"attach" withContentType: @"text/plain" content: body];
+    CBLAttachment* att = [[newRev save: nil] attachmentNamed: @"attach"];
+    Assert(att);
+
+    request = [conn request];
+    request.profile = @"getAttachment";
+    request[@"digest"] = att.metadata[@"digest"];
+    [self sendRequest: request expectedErrorCode: 0 expectedResult: nil];
+
+    // proveAttachment:
+    request = [conn request];
+    request.profile = @"proveAttachment";
+    request[@"digest"] = att.metadata[@"digest"];
+    uint8_t nonceBytes[16];
+    SecRandomCopyBytes(kSecRandomDefault, sizeof(nonceBytes), nonceBytes);
+    NSData* nonceData = [NSData dataWithBytes: nonceBytes length: sizeof(nonceBytes)];
+    request.body = nonceData;
+    [self sendRequest: request expectedErrorCode: 0 expectedResult: nil];
+
+    _expectDidClose = [self expectationWithDescription: @"didClose"];
+    [conn close];
+    [self waitForExpectationsWithTimeout: kTimeout handler: nil];
+}
+
+
+#pragma mark - Test Utilities
+
+- (NSURL*) listenerSyncURL {
+    NSURL* url = [[listener.URL URLByAppendingPathComponent: db.name]
+                                    URLByAppendingPathComponent: @"_blipsync"];
+#if TARGET_OS_IPHONE && TARGET_OS_SIMULATOR
+    // Simulator has trouble with Bonjour URLs sometimes -- symptom is that both client and
+    // listener simultaneously get a connection refused/aborted (-61 or -9806) error.
+    NSURLComponents* comp = [[NSURLComponents alloc] initWithURL: url resolvingAgainstBaseURL: NO];
+    comp.host = @"localhost";
+    url = comp.URL;
+#endif
+    return url;
+}
 
 - (void) connect {
-    NSURL* url = [[listener.URL URLByAppendingPathComponent: db.name]
-                                      URLByAppendingPathComponent: @"_blipsync"];
-    Log(@"Connecting to <%@>", url);
+    NSURL* url = self.listenerSyncURL;
     BLIPPocketSocketConnection* conn = [[BLIPPocketSocketConnection alloc] initWithURL: url];
     [conn setDelegate: self queue: dispatch_get_main_queue()];
     conn.credential = clientCredential;
@@ -122,6 +224,21 @@ static UInt16 sPort = 60000;
 
     _expectDidClose = [self expectationWithDescription: @"didClose"];
     [conn close];
+    [self waitForExpectationsWithTimeout: kTimeout handler: nil];
+}
+
+- (void)sendRequest: (BLIPRequest*)request
+  expectedErrorCode: (NSInteger)expectedErrorCode
+     expectedResult: (id)expectedResult
+{
+    XCTestExpectation* expectDidComplete = [self expectationWithDescription: @"didComplete"];
+    [request send].onComplete = ^(BLIPResponse* response) {
+        Assert(response);
+        AssertEq(response.error.code, expectedErrorCode);
+        if (expectedResult)
+            AssertEqual(response.bodyJSON, expectedResult);
+        [expectDidComplete fulfill];
+    };
     [self waitForExpectationsWithTimeout: kTimeout handler: nil];
 }
 
@@ -197,6 +314,13 @@ static NSString* addressToString(NSData* addrData) {
 @end
 
 
+@interface ListenerTestRemoteRequest : CBLRemoteRequest {
+@private
+    NSMutableData* _data;
+}
+@property (readonly) NSData* data;
+@property (readonly) int status;
+@end
 
 
 @interface ListenerHTTP_Tests : Listener_Tests <CBLRemoteRequestDelegate>
@@ -212,8 +336,88 @@ static NSString* addressToString(NSData* addrData) {
     return [CBLHTTPListener class];
 }
 
-- (void)testSSL_NoClientCert    {[super testSSL_NoClientCert];}
-- (void)testSSL_ClientCert      {[super testSSL_ClientCert];}
+// Have to override these so Xcode will recognize that these tests exist in this class:
+// Have to override these so Xcode will recognize that these tests exist in this class:
+- (void)test01_SSL_NoClientCert    {[super test01_SSL_NoClientCert];}
+- (void)test02_SSL_ClientCert      {[super test02_SSL_ClientCert];}
+
+- (void)test03_ReadOnly {
+    if (!self.isSQLiteDB)
+        return;
+
+    // Enable readOnly mode:
+    listener.readOnly = YES;
+    [self startListener];
+
+    NSString* dbPath = [NSString stringWithFormat:@"%@/", db.name];
+
+    [self sendRequest: @"PUT" path: [dbPath stringByAppendingString: @"doc1"]
+              headers: nil body: @{} expectedStatus: 403
+      expectedHeaders: nil expectedResult: nil];
+
+    [self sendRequest: @"PUT" path: [dbPath stringByAppendingString: @"_local/remotecheckpointdocid"]
+              headers: nil body: @{@"lastSequence": @"1"} expectedStatus: 201
+      expectedHeaders: nil expectedResult: nil];
+
+    Assert([[db documentWithID: @"doc2"] putProperties: @{} error: nil]);
+    [self sendRequest: @"GET" path: [dbPath stringByAppendingString: @"doc2"]
+              headers: nil body: nil expectedStatus: 200
+      expectedHeaders: nil expectedResult: nil];
+}
+
+- (void)test04_GetRange {
+    [self startListener];
+
+    // Create a document with an attachment:
+    CBLDocument* doc = [db createDocument];
+    CBLUnsavedRevision* newRev = [doc newRevision];
+    NSData* attach = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
+    [newRev setAttachmentNamed: @"attach" withContentType: @"text/plain" content: attach];
+    Assert([newRev save: nil]);
+
+    // URL to the attachment:
+    NSString* path = [NSString stringWithFormat:@"%@/%@/attach", db.name, doc.documentID];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=5-15"} body: nil
+       expectedStatus: 206 expectedHeaders: @{@"Content-Range": @"bytes 5-15/27"}
+       expectedResult: [@"is the body" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=12-"} body: nil
+       expectedStatus: 206 expectedHeaders: @{@"Content-Range": @"bytes 12-26/27"}
+       expectedResult: [@"body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=12-100"} body: nil
+       expectedStatus: 206 expectedHeaders: @{@"Content-Range": @"bytes 12-26/27"}
+       expectedResult: [@"body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=-7"} body: nil
+       expectedStatus: 206 expectedHeaders: @{@"Content-Range": @"bytes 20-26/27"}
+       expectedResult: [@"attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=5-3"} body: nil
+       expectedStatus: 200 expectedHeaders: nil
+       expectedResult: [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=100-"} body: nil
+       expectedStatus: 416 expectedHeaders: @{@"Content-Range": @"bytes */27"}
+       expectedResult: nil];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=-100"} body: nil
+       expectedStatus: 200 expectedHeaders: nil
+       expectedResult: [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=500-100"} body: nil
+       expectedStatus: 200 expectedHeaders: nil
+       expectedResult: [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=0-27"} body: nil
+       expectedStatus: 200 expectedHeaders: nil
+       expectedResult: [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding]];
+
+    [self sendRequest: @"GET" path: path headers: @{@"Range": @"bytes=27-28"} body: nil
+       expectedStatus: 416 expectedHeaders: @{@"Content-Range": @"bytes */27"}
+       expectedResult: nil];
+}
 
 
 - (void) connect {
@@ -239,12 +443,85 @@ static NSString* addressToString(NSData* addrData) {
 - (BOOL) checkSSLServerTrust: (NSURLProtectionSpace*)protectionSpace {
     Log(@"checkSSLServerTrust called!");
     [_expectCheckServerTrust fulfill];
+    // Verify that the cert is the same one I told the listener to use:
     SecCertificateRef cert = SecTrustGetCertificateAtIndex(protectionSpace.serverTrust, 0);
     SecCertificateRef realServerCert;
     SecIdentityCopyCertificate(listener.SSLIdentity, &realServerCert);
     Assert(CFEqual(cert, realServerCert));
     CFRelease(realServerCert);
+    Assert(CBLForceTrusted(protectionSpace.serverTrust));
     return YES;
+}
+
+
+- (void) sendRequest: (NSString*)method
+                path: (NSString*)path
+             headers: (NSDictionary*)headers
+                body: (id)bodyObj
+      expectedStatus: (NSInteger)expectedStatus
+     expectedHeaders: (NSDictionary*)expectedHeader
+      expectedResult: (NSData*)expectedResult {
+    XCTestExpectation* expectDidComplete = [self expectationWithDescription: @"didComplete"];
+    NSURL* url = [NSURL URLWithString: path relativeToURL: listener.URL];
+    ListenerTestRemoteRequest* req =
+        [[ListenerTestRemoteRequest alloc] initWithMethod: method
+                                                      URL: url
+                                                     body: bodyObj
+                                           requestHeaders: headers
+                                             onCompletion:
+         ^(ListenerTestRemoteRequest* result, NSError *error) {
+             AssertEq(result.status, expectedStatus);
+             for (NSString* key in [expectedHeader allKeys])
+                 AssertEqual(result.responseHeaders[key], expectedHeader[key]);
+             if (expectedResult)
+                 AssertEqual(result.data, expectedResult);
+
+             [expectDidComplete fulfill];
+         }];
+
+    if (clientCredential) {
+        req.authorizer = [[CBLClientCertAuthorizer alloc] initWithIdentity: clientCredential.identity
+                                                           supportingCerts: clientCredential.certificates];
+    }
+
+    req.delegate = self;
+    [req start];
+    [self waitForExpectationsWithTimeout: kTimeout handler: nil];
+}
+
+@end
+
+@implementation ListenerTestRemoteRequest
+
+@synthesize data=_data;
+
+- (int)status {
+    return _status;
+}
+
+- (void)setupRequest: (NSMutableURLRequest *)request withBody: (id)body {
+    if (body) {
+        if ([body isKindOfClass: [NSData class]]) {
+            request.HTTPBody = body;
+        } else {
+            NSError* error = nil;
+            request.HTTPBody = [CBLJSON dataWithJSONObject: body options:0 error: &error];
+            if (error)
+                Log(@"Cannot parse JSON body with error: %@", error);
+        }
+    }
+}
+
+- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
+    [super connection: connection didReceiveData: data];
+    if (!_data)
+        _data = [[NSMutableData alloc] initWithCapacity: data.length];
+    [_data appendData: data];
+}
+
+- (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
+    [self clearConnection];
+    [self respondWithResult: self error: error];
 }
 
 @end

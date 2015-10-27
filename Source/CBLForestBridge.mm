@@ -14,8 +14,13 @@
 //  and limitations under the License.
 
 #import "CBLForestBridge.h"
+extern "C" {
+#import "ExceptionUtils.h"
+#import "CBLSymmetricKey.h"
+}
 
 using namespace forestdb;
+using namespace couchbase_lite;
 
 
 @implementation CBLForestBridge
@@ -29,6 +34,47 @@ static NSData* dataOfNode(const Revision* rev) {
     } catch (...) {
         return nil;
     }
+}
+
+
++ (void) setEncryptionKey: (fdb_encryption_key*)fdbKey fromSymmetricKey: (CBLSymmetricKey*)key {
+    if (key) {
+        fdbKey->algorithm = FDB_ENCRYPTION_AES256;
+        Assert(key.keyData.length <= sizeof(fdbKey->bytes));
+        memcpy(fdbKey->bytes, key.keyData.bytes, sizeof(fdbKey->bytes));
+    } else {
+        fdbKey->algorithm = FDB_ENCRYPTION_NONE;
+    }
+}
+
+
++ (Database*) openDatabaseAtPath: (NSString*)path
+                      withConfig: (Database::config&)config
+                   encryptionKey: (CBLSymmetricKey*)key
+                           error: (NSError**)outError
+{
+    [self setEncryptionKey: &config.encryption_key fromSymmetricKey: key];
+    __block Database* db = NULL;
+    BOOL ok = tryError(outError, ^{
+        std::string pathStr(path.fileSystemRepresentation);
+        try {
+            db = new Database(pathStr, config);
+        } catch (forestdb::error error) {
+            if (error.status == FDB_RESULT_INVALID_COMPACTION_MODE
+                        && config.compaction_mode == FDB_COMPACTION_AUTO) {
+                // Databases created by earlier builds of CBL (pre-1.2) didn't have auto-compact.
+                // Opening them with auto-compact causes this error. Upgrade such a database by
+                // switching its compaction mode:
+                Log(@"%@: Upgrading to auto-compact", self);
+                config.compaction_mode = FDB_COMPACTION_MANUAL;
+                db = new Database(pathStr, config);
+                db->setCompactionMode(FDB_COMPACTION_AUTO);
+            } else {
+                throw error;
+            }
+        }
+    });
+    return ok ? db : nil;
 }
 
 
@@ -62,23 +108,6 @@ static NSData* dataOfNode(const Revision* rev) {
     }
     if (withBody && ![self loadBodyOfRevisionObject: rev doc: doc])
         return nil;
-    return rev;
-}
-
-
-+ (CBL_MutableRevision*) revisionObjectFromForestDoc: (VersionedDocument&)doc
-                                            sequence: (forestdb::sequence)sequence
-                                            withBody: (BOOL)withBody
-{
-    const Revision* revNode = doc.getBySequence(sequence);
-    if (!revNode)
-        return nil;
-    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: (NSString*)doc.docID()
-                                                                    revID: (NSString*)revNode->revID
-                                                                  deleted: revNode->isDeleted()];
-    if (withBody && ![self loadBodyOfRevisionObject: rev doc: doc])
-        return nil;
-    rev.sequence = sequence;
     return rev;
 }
 
@@ -118,11 +147,11 @@ static NSData* dataOfNode(const Revision* rev) {
 }
 
 
-+ (NSArray*) getCurrentRevisionIDs: (VersionedDocument&)doc {
++ (NSArray*) getCurrentRevisionIDs: (VersionedDocument&)doc includeDeleted: (BOOL)includeDeleted {
     NSMutableArray* currentRevIDs = $marray();
     auto revs = doc.currentRevisions();
     for (auto rev = revs.begin(); rev != revs.end(); ++rev)
-        if (!(*rev)->isDeleted())
+        if (includeDeleted || !(*rev)->isDeleted())
             [currentRevIDs addObject: (NSString*)(*rev)->revID];
     return currentRevIDs;
 }
@@ -161,23 +190,53 @@ static NSData* dataOfNode(const Revision* rev) {
 @end
 
 
+namespace couchbase_lite {
 
-CBLStatus CBLStatusFromForestDBStatus(int fdbStatus) {
-    switch (fdbStatus) {
-        case FDB_RESULT_SUCCESS:
-            return kCBLStatusOK;
-        case FDB_RESULT_KEY_NOT_FOUND:
-        case FDB_RESULT_NO_SUCH_FILE:
-            return kCBLStatusNotFound;
-        case FDB_RESULT_RONLY_VIOLATION:
-            return kCBLStatusForbidden;
-        case FDB_RESULT_CHECKSUM_ERROR:
-        case FDB_RESULT_FILE_CORRUPTION:
-        case error::CorruptRevisionData:
-            return kCBLStatusCorruptError;
-        case error::BadRevisionID:
-            return kCBLStatusBadID;
-        default:
-            return kCBLStatusDBError;
+    CBLStatus tryStatus(CBLStatus(^block)()) {
+        try {
+            return block();
+        } catch (forestdb::error err) {
+            return CBLStatusFromForestDBStatus(err.status);
+        } catch (NSException* x) {
+            MYReportException(x, @"CBL_ForestDBStorage");
+            return kCBLStatusException;
+        } catch (...) {
+            Warn(@"Unknown C++ exception caught in CBL_ForestDBStorage");
+            return kCBLStatusException;
+        }
     }
+
+
+    bool tryError(NSError** outError, void(^block)()) {
+        CBLStatus status = tryStatus(^{
+            block();
+            return kCBLStatusOK;
+        });
+        return CBLStatusToOutNSError(status, outError);
+    }
+
+
+    CBLStatus CBLStatusFromForestDBStatus(int fdbStatus) {
+        switch (fdbStatus) {
+            case FDB_RESULT_SUCCESS:
+                return kCBLStatusOK;
+            case FDB_RESULT_KEY_NOT_FOUND:
+            case FDB_RESULT_NO_SUCH_FILE:
+                return kCBLStatusNotFound;
+            case FDB_RESULT_RONLY_VIOLATION:
+                return kCBLStatusForbidden;
+            case FDB_RESULT_NO_DB_HEADERS:
+            case FDB_RESULT_CRYPTO_ERROR:
+                return kCBLStatusUnauthorized;     // assuming db is encrypted
+            case FDB_RESULT_CHECKSUM_ERROR:
+            case FDB_RESULT_FILE_CORRUPTION:
+            case error::CorruptRevisionData:
+                return kCBLStatusCorruptError;
+            case error::BadRevisionID:
+                return kCBLStatusBadID;
+            default:
+                return kCBLStatusDBError;
+        }
+    }
+
 }

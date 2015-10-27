@@ -22,11 +22,7 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
 
 
 /** Asynchronous HTTP request; a fairly simple wrapper around NSURLConnection that calls a completion block when ready. */
-@interface CBLRemoteRequest : NSObject <NSURLConnectionDelegate
-#if TARGET_OS_IPHONE || defined(__MAC_10_8)
-                                                              , NSURLConnectionDataDelegate
-#endif
-                                                                                           >
+@interface CBLRemoteRequest : NSObject <NSURLConnectionDelegate, NSURLConnectionDataDelegate>
 {
     @protected
     NSMutableURLRequest* _request;
@@ -79,6 +75,10 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust);
 - (void) cancelWithStatus: (int)status;
 - (void) respondWithResult: (id)result error: (NSError*)error;
 - (BOOL) retry;
+
+#if DEBUG
+@property BOOL debugAlwaysTrust;    // For unit tests only!
+#endif
 
 @end
 

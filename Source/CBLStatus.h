@@ -22,6 +22,7 @@ typedef enum {
     kCBLStatusMethodNotAllowed = 405,
     kCBLStatusNotAcceptable  = 406,
     kCBLStatusConflict       = 409,
+    kCBLStatusGone           = 410,
     kCBLStatusDuplicate      = 412,      // Formally known as "Precondition Failed"
     kCBLStatusUnsupportedType= 415,
     
@@ -46,6 +47,7 @@ typedef enum {
     kCBLStatusCallbackError  = 593,      // app callback (emit fn, etc.) failed
     kCBLStatusException      = 594,      // Exception raised/caught
     kCBLStatusDBBusy         = 595,      // SQLite DB is busy (this is recoverable!)
+    kCBLStatusCanceled       = 596,      // Operation was canceled by client
 } CBLStatus;
 
 

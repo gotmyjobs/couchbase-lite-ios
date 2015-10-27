@@ -7,6 +7,7 @@
 //
 
 #import "CBLSyncConnection_Internal.h"
+#import "CBL_BlobStoreWriter.h"
 #import "MYBuffer.h"
 
 
@@ -72,6 +73,8 @@
     // (Note: even if we got 0 changes (i.e. caught up) we still need to go through the db queue
     // before announcing it, so previously queued change processing blocks get to run first.)
     LogTo(Sync, @"Received %u changes", (unsigned)changes.count);
+    if (![self accessCheckForRequest: request])
+        return;
     [request deferResponse];
     [self onDatabaseQueue: ^{
         CFAbsoluteTime time = CFAbsoluteTimeGetCurrent();
@@ -156,6 +159,8 @@
 // Received a "rev" request
 - (void) handleIncomingRevision: (BLIPRequest*)request {
     _awaitingRevs--;
+    if (![self accessCheckForRequest: request])
+        return;
     _insertingRevs++;
 
     // Look for "_attachments" property, trying not to parse JSON if we can avoid it:
@@ -167,6 +172,7 @@
         attachments = $castIf(NSDictionary, props[@"_attachments"]);
         docID = props[@"_id"];
     }
+    
     if (attachments.count == 0) {
         [self queueRevisionToInsert: request withAttachments: nil];
         return;
@@ -275,13 +281,13 @@
         if (error == nil) {
             [writer finish];
             LogTo(SyncVerbose, @"Received attachment with digest %@ (%llu bytes)",
-                  digest, writer.length);
+                  digest, writer.bytesWritten);
             [self removeAttachmentProgress: attProgress pulling: YES];
             if ([writer.SHA1DigestString isEqualToString: digest]) {
                 onComplete(writer);
             } else {
                 Warn(@"Attachment received has digest %@; should have been %@ (%llu bytes)",
-                     writer.SHA1DigestString, digest, writer.length);
+                     writer.SHA1DigestString, digest, writer.bytesWritten);
                 [writer cancel];
                 onComplete(nil);
             }

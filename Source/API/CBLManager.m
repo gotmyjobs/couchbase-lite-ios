@@ -92,7 +92,7 @@ static NSString* CBLFullVersionInfo( void ) {
 
 
 @synthesize dispatchQueue=_dispatchQueue, directory = _dir;
-@synthesize customHTTPHeaders = _customHTTPHeaders;
+@synthesize customHTTPHeaders = _customHTTPHeaders, upgradeStorage=_upgradeStorage;
 @synthesize storageType=_storageType, replicatorClassName=_replicatorClassName;
 
 
@@ -249,7 +249,6 @@ static CBLManager* sInstance;
 
 #if DEBUG
 + (instancetype) createEmptyAtPath: (NSString*)path {
-    [CBLDatabase setAutoCompact: NO]; // unit tests don't want autocompact
     [[NSFileManager defaultManager] removeItemAtPath: path error: NULL];
     NSError* error;
     CBLManager* dbm = [[self alloc] initWithDirectory: path
@@ -327,14 +326,16 @@ static CBLManager* sInstance;
     for (NSString* filename in [files pathsMatchingExtensions: @[kV1DBExtension]]) {
         NSString* name = [self nameOfDatabaseAtPath: filename];
         NSString* oldDbPath = [_dir stringByAppendingPathComponent: filename];
-        [self upgradeDatabaseNamed: name atPath: oldDbPath error: NULL];
+        [self upgradeDatabaseNamed: name atPath: oldDbPath andClose: YES error: NULL];
     }
 }
 
 
 - (BOOL) upgradeDatabaseNamed: (NSString*)name
                        atPath: (NSString*)dbPath
-                        error: (NSError**)outError {
+                     andClose: (BOOL)andClose
+                        error: (NSError**)outError
+{
     Class databaseUpgradeClass = [self databaseUpgradeClass];
     if (!databaseUpgradeClass) {
         // Gracefully skipping the upgrade:
@@ -342,13 +343,7 @@ static CBLManager* sInstance;
         return YES;
     }
 
-    if (![dbPath.pathExtension isEqualToString:kV1DBExtension]) {
-        // Gracefully skipping the upgrade:
-        Warn(@"Upgrade skipped: Database file extension is not %@", kV1DBExtension);
-        return YES;
-    }
-
-    NSLog(@"CouchbaseLite: Upgrading v1 database at %@ ...", dbPath);
+    NSLog(@"CouchbaseLite: Upgrading database at %@ ...", dbPath);
     if (![name isEqualToString: @"_replicator"]) {
         // Create and open new CBLDatabase:
         NSError* error;
@@ -367,24 +362,54 @@ static CBLManager* sInstance;
             if (CBLStatusIsError(status)) {
                 Warn(@"Upgrade failed: status %d", status);
                 [upgrader backOut];
-                if (outError)
-                    *outError = error;
-                return NO;
+                return CBLStatusToOutNSError(status, outError);
             }
         }
+        if (andClose)
         [db _close];
     }
 
     // Remove old database file and its SQLite side files:
-    NSFileManager* fmgr = [NSFileManager defaultManager];
-    for (NSString* suffix in @[@"", @"-wal", @"-shm"])
-        [fmgr removeItemAtPath: [dbPath stringByAppendingString: suffix] error: NULL];
+    moveSQLiteDbFiles(dbPath, nil);
+
+    if ([dbPath.pathExtension isEqualToString:kV1DBExtension]) {
+        // If upgrading a v1 database, delete its old attachments directory:
     NSString* oldAttachmentsPath = [[dbPath stringByDeletingPathExtension]
                                     stringByAppendingString: @" attachments"];
-    [fmgr removeItemAtPath: oldAttachmentsPath error: NULL];
+        [[NSFileManager defaultManager] removeItemAtPath: oldAttachmentsPath error: NULL];
+    }
     NSLog(@"    ...success!");
 
     return YES;
+}
+
+
+- (BOOL) upgradeV1DatabaseNamed: (NSString*)name
+                         atPath: (NSString*)dbPath
+                          error: (NSError**)outError
+{
+    if ([dbPath.pathExtension isEqualToString:kV1DBExtension]) {
+        return [self upgradeDatabaseNamed: name atPath: dbPath andClose: NO error: outError];
+    } else {
+        // Gracefully skipping the upgrade:
+        Warn(@"Upgrade skipped: Database file extension is not %@", kV1DBExtension);
+        return YES;
+    }
+}
+
+
+static void moveSQLiteDbFiles(NSString* oldDbPath, NSString* newDbPath) {
+    NSFileManager* fmgr = [NSFileManager defaultManager];
+    for (NSString* suffix in @[@"", @"-wal", @"-shm"]) {
+        NSString* oldFile = [oldDbPath stringByAppendingString: suffix];
+        if (newDbPath) {
+            [fmgr moveItemAtPath: oldFile
+                          toPath: [newDbPath stringByAppendingString: suffix]
+                           error: NULL];
+        } else {
+            [fmgr removeItemAtPath: oldFile error: NULL];
+        }
+    }
 }
 
 
@@ -436,7 +461,7 @@ static CBLManager* sInstance;
 
 
 - (CBL_Server*) backgroundServer {
-    CBL_Shared* shared = _shared;
+    CBL_Shared* shared = self.shared;
     Assert(shared);
     @synchronized(shared) {
         CBL_Server* server = shared.backgroundServer;
@@ -534,12 +559,7 @@ static CBLManager* sInstance;
 {
     CBLSymmetricKey* realKey = nil;
     if (keyOrPassword) {
-        if ([keyOrPassword isKindOfClass: [NSString class]]) {
-            realKey = [[CBLSymmetricKey alloc] initWithPassword: keyOrPassword];
-        } else if (keyOrPassword) {
-            Assert([keyOrPassword isKindOfClass: [NSData class]]);
-            realKey = [[CBLSymmetricKey alloc] initWithKeyData: keyOrPassword];
-        }
+        realKey = [[CBLSymmetricKey alloc] initWithKeyOrPassword: keyOrPassword];
         if (!realKey)
             return NO;
     }
@@ -549,6 +569,31 @@ static CBLManager* sInstance;
           inDatabaseNamed: name];
     return YES;
 }
+
+
+#if !TARGET_OS_IPHONE
+- (BOOL) encryptDatabaseNamed: (NSString*)name {
+    NSString* dir = self.directory.stringByAbbreviatingWithTildeInPath;
+    NSString* itemName = $sprintf(@"%@ database in %@", name, dir);
+    NSError* error;
+    CBLSymmetricKey* key = [[CBLSymmetricKey alloc] initWithKeychainItemNamed: itemName
+                                                                        error: &error];
+    if (!key) {
+        if (error.code == errSecItemNotFound) {
+            key = [CBLSymmetricKey new];
+            if (![key saveKeychainItemNamed: itemName])
+                return NO;
+        } else {
+            return NO;
+        }
+    }
+    [self.shared setValue: key
+                  forType: @"encryptionKey"
+                     name: @""
+          inDatabaseNamed: name];
+    return YES;
+}
+#endif
 
 
 #if DEBUG
@@ -607,7 +652,7 @@ static CBLManager* sInstance;
         CBLCopyFileIfExists([databasePath stringByAppendingString: @"-shm"],
                             [dstDbPath stringByAppendingString: @"-shm"], outError) &&
         (!attachmentsPath || CBLCopyFileIfExists(attachmentsPath, dstAttsPath, outError)) &&
-        (isDbPathDir || [self upgradeDatabaseNamed: databaseName atPath: dstDbPath error: NULL]) &&
+        (isDbPathDir || [self upgradeV1DatabaseNamed: databaseName atPath: dstDbPath error: NULL]) &&
         [db open: outError] &&
         [db saveLocalUUIDInLocalCheckpointDocument: outError] &&
         [db replaceUUIDs: outError];
@@ -701,9 +746,25 @@ static CBLManager* sInstance;
         return [repl localDatabase] == db;
     }];
     [_databases removeObjectForKey: name];
-    [_shared closedDatabase: name];
+
+    CBL_Shared* strongShared = _shared;
+    [strongShared closedDatabase: name];
+
+    // Close background database:
+    [strongShared.backgroundServer tellDatabaseManager: ^(CBLManager* bgmgr) {
+        NSError* error;
+        if (![bgmgr _closeDatabaseNamed: name error: &error])
+            Warn(@"Cannot close background database named %@: %@", name, error);
+    }];
 }
 
+
+- (BOOL) _closeDatabaseNamed: (NSString*)name error: (NSError**)outError {
+    CBLDatabase* db = _databases[name];
+    if (db)
+        return [db close: outError];
+    return YES;
+}
 
 #pragma mark - REPLICATION:
 
@@ -863,39 +924,15 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     // Extract the parameters from the JSON request body:
     // http://wiki.apache.org/couchdb/Replication
     CBLDatabase* db;
-    NSURL* remote;
-    BOOL push, createTarget;
-    NSDictionary* headers;
-    id<CBLAuthorizer> authorizer;
-
-    CBLStatus status = [self parseReplicatorProperties: properties
-                                            toDatabase: &db remote: &remote
-                                                isPush: &push
-                                          createTarget: &createTarget
-                                               headers: &headers
-                                            authorizer: &authorizer];
+    CBLStatus status;
+    CBL_ReplicatorSettings* settings = [self replicatorSettingsWithProperties: properties
+                                                                   toDatabase: &db
+                                                                       status: &status];
     if (CBLStatusIsError(status)) {
         if (outStatus)
             *outStatus = status;
         return nil;
     }
-
-    NSString* filterName = $castIf(NSString, properties[@"filter"]);
-    NSArray* docIDs = $castIf(NSArray, properties[@"doc_ids"]);
-
-    CBL_ReplicatorSettings* settings = [[CBL_ReplicatorSettings alloc] initWithRemote: remote
-                                                                                 push: push];
-    settings.continuous = [$castIf(NSNumber, properties[@"continuous"]) boolValue];
-    settings.filterName = filterName;
-    settings.filterParameters = $castIf(NSDictionary, properties[@"query_params"]);
-    settings.docIDs = docIDs;
-    settings.options = properties;
-    settings.requestHeaders = headers;
-    settings.authorizer = authorizer;
-    settings.createTarget = push && createTarget;
-
-    if (![settings compilePushFilterForDatabase: db status: outStatus])
-        return nil;
 
     id<CBL_Replicator> repl = [[self.replicatorClass alloc] initWithDB: db settings: settings];
     if (!repl) {
@@ -912,6 +949,58 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     if (outStatus)
         *outStatus = kCBLStatusOK;
     return repl;
+}
+
+
+- (CBL_ReplicatorSettings*) replicatorSettingsWithProperties: (NSDictionary*)properties
+                                                  toDatabase: (CBLDatabase**)outDatabase
+                                                      status: (CBLStatus*)outStatus {
+    // Extract the parameters from the JSON request body:
+    // http://wiki.apache.org/couchdb/Replication
+    NSURL* remote;
+    BOOL push, createTarget;
+    NSDictionary* headers;
+    id<CBLAuthorizer> authorizer;
+    CBLDatabase* database;
+
+    CBLStatus status = [self parseReplicatorProperties: properties
+                                            toDatabase: &database
+                                                remote: &remote
+                                                isPush: &push
+                                          createTarget: &createTarget
+                                               headers: &headers
+                                            authorizer: &authorizer];
+    if (outStatus)
+        *outStatus = status;
+
+    if (CBLStatusIsError(status))
+        return nil;
+
+    NSString* filterName = $castIf(NSString, properties[@"filter"]);
+    NSArray* docIDs = $castIf(NSArray, properties[@"doc_ids"]);
+
+    CBL_ReplicatorSettings* settings = [[CBL_ReplicatorSettings alloc] initWithRemote: remote
+                                                                                 push: push];
+    settings.continuous = [$castIf(NSNumber, properties[@"continuous"]) boolValue];
+    settings.filterName = filterName;
+    settings.filterParameters = $castIf(NSDictionary, properties[@"query_params"]);
+    settings.docIDs = docIDs;
+    settings.options = properties;
+    settings.requestHeaders = headers;
+    settings.authorizer = authorizer;
+    settings.createTarget = push && createTarget;
+
+    NSNumber* attachments = $castIf(NSNumber, properties[@"attachments"]);
+    if (attachments)
+        settings.downloadAttachments = attachments.boolValue;
+
+    if (![settings compilePushFilterForDatabase: database status: outStatus])
+        return nil;
+
+    if (outDatabase)
+        *outDatabase = database;
+
+    return settings;
 }
 
 

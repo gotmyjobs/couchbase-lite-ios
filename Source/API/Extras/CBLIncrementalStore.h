@@ -37,7 +37,8 @@ typedef enum
     CBLIncrementalStoreErrorUnsupportedRequestType,
     CBLIncrementalStoreErrorUnsupportedPredicate,
     CBLIncrementalStoreErrorPredicateKeyPathNotFoundInEntity,
-    CBLIncrementalStoreErrorUnsupportedFetchRequestResultType
+    CBLIncrementalStoreErrorUnsupportedFetchRequestResultType,
+    CBLIncrementalStoreErrorUnsupportedFetchRequest
 } CBLIncrementalStoreError;
 
 @class CBLDocument;
@@ -52,6 +53,11 @@ typedef enum
  * @parameter conflictingRevisions the conflicting revisions of that document as CBLRevision instances.
  */
 typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
+
+@protocol CBLIncrementalStoreDelegate <NSObject>
+@optional
+- (NSDictionary *) storeWillSaveDocument:(NSDictionary *)document;
+@end
 
 
 /** NSIncrementalStore implementation that persists the data in a CouchbaseLite database. Before using this store you need to call #updateManagedObjectModel:
@@ -70,6 +76,9 @@ typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
 
 /** Conflict handling block that gets called when conflicts are to be handled. Initialied with a generic conflicts handler, can be set to NULL to not handle conflicts at all. */
 @property (nonatomic, copy) CBLISConflictHandler conflictHandler;
+
+/** Delegate allowing some more customization to the developer's implementation */
+@property (nonatomic, weak) id<CBLIncrementalStoreDelegate> delegate;
 
 /** An optional dictionary of extra properties for the incremental store.*/
 @property (nonatomic, copy) NSDictionary* customProperties;

@@ -21,6 +21,7 @@ NSString* const kSyncNestedProgressKey = @"CBLChildren";
 @synthesize pullProgress=_pullProgress, nestedPullProgress=_nestedPullProgress;
 @synthesize pushProgress=_pushProgress, nestedPushProgress=_nestedPushProgress;
 @synthesize remoteCheckpointDocID=_remoteCheckpointDocID, replicator=_replicator;
+@synthesize onSyncAccessCheck=_onSyncAccessCheck;
 #if DEBUG
 @synthesize savingCheckpoint=_savingCheckpoint;  // for unit tests
 #endif
@@ -262,6 +263,20 @@ NSString* const kSyncNestedProgressKey = @"CBLChildren";
     else
         self.nestedPushProgress = children;
     [parent setUserInfoObject: children forKey: kSyncNestedProgressKey];
+}
+
+
+- (BOOL) accessCheckForRequest: (BLIPRequest*)request {
+    if (self.onSyncAccessCheck) {
+        CBLStatus status = self.onSyncAccessCheck(request);
+        if (CBLStatusIsError(status)) {
+            NSString* message;
+            int code = CBLStatusToHTTPStatus(status, &message);
+            [request respondWithErrorCode: code message: message];
+            return NO;
+        }
+    }
+    return YES;
 }
 
 

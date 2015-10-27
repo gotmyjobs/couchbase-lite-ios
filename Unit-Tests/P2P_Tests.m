@@ -90,16 +90,16 @@ static UInt16 sPort = 60100;
     [self createDocsIn: db withAttachments: NO];
     Log(@"Pushing...");
     CBLReplication* repl = [db createPushReplication: listenerDBURL];
-    [self runReplication: repl expectedChangesCount: kNDocuments];
-    [self verifyDocsIn: listenerDB withAttachments: NO];
+    if ([self runReplication: repl expectedChangesCount: kNDocuments])
+        [self verifyDocsIn: listenerDB withAttachments: NO];
 }
 
 - (void) testPull {
     [self createDocsIn: listenerDB withAttachments: NO];
     Log(@"Pulling...");
     CBLReplication* repl = [db createPullReplication: listenerDBURL];
-    [self runReplication: repl expectedChangesCount: kNDocuments];
-    [self verifyDocsIn: db withAttachments: NO];
+    if ([self runReplication: repl expectedChangesCount: kNDocuments])
+        [self verifyDocsIn: db withAttachments: NO];
 }
 
 - (void) testPushAttachments {
@@ -108,16 +108,16 @@ static UInt16 sPort = 60100;
     [self createDocsIn: db withAttachments: YES];
     Log(@"Pushing...");
     CBLReplication* repl = [db createPushReplication: listenerDBURL];
-    [self runReplication: repl expectedChangesCount: 0];
-    [self verifyDocsIn: listenerDB withAttachments: YES];
+    if ([self runReplication: repl expectedChangesCount: 0])
+        [self verifyDocsIn: listenerDB withAttachments: YES];
 }
 
 - (void) testPullAttachments {
     [self createDocsIn: listenerDB withAttachments: YES];
     Log(@"Pulling...");
     CBLReplication* repl = [db createPullReplication: listenerDBURL];
-    [self runReplication: repl expectedChangesCount: 0];
-    [self verifyDocsIn: db withAttachments: YES];
+    if ([self runReplication: repl expectedChangesCount: 0])
+        [self verifyDocsIn: db withAttachments: YES];
 }
 
 
@@ -159,7 +159,7 @@ static UInt16 sPort = 60100;
 }
 
 
-- (void) runReplication: (CBLReplication*)repl
+- (BOOL) runReplication: (CBLReplication*)repl
          expectedChangesCount: (NSUInteger)expectedChangesCount
 {
 #if USE_AUTH
@@ -188,9 +188,12 @@ static UInt16 sPort = 60100;
 
     [self waitForExpectationsWithTimeout: 30.0 handler: nil];
     AssertNil(repl.lastError);
+    if (repl.lastError)
+        return NO;
     if (expectedChangesCount > 0) {
         AssertEq(repl.completedChangesCount, expectedChangesCount);
     }
+    return YES;
 }
 
 
@@ -204,6 +207,14 @@ static UInt16 sPort = 60100;
 
 @implementation P2P_BLIP_Tests
 
+- (void)invokeTest {
+    // Skip these tests if TestNewReplicator isn't enabled:
+    if ([[NSUserDefaults standardUserDefaults] boolForKey: @"TestNewReplicator"])
+        [super invokeTest];
+    else
+        Log(@"(Skipping test; TestNewReplicator is not enabled)");
+}
+
 - (Class) listenerClass {
     return [CBLSyncListener class];
 }
@@ -216,12 +227,6 @@ static UInt16 sPort = 60100;
 - (void) testPull               {[super testPull];}
 - (void) testPushAttachments    {[super testPushAttachments];}
 - (void) testPullAttachments    {[super testPullAttachments];}
-
-- (void) runReplication: (CBLReplication*)repl
-         expectedChangesCount: (NSUInteger)expectedChangesCount
-{
-    [super runReplication: repl expectedChangesCount: expectedChangesCount];
-}
 
 @end
 

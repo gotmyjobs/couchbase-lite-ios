@@ -407,7 +407,14 @@
                 NSString* docType = checkDocTypes ? [r stringForColumnIndex: 6] : nil;
 
                 // Skip rows with the same doc_id -- these are losing conflicts.
+                NSMutableArray* conflicts = nil;
                 while ((keepGoing = [r next]) && [r longLongIntForColumnIndex: 0] == doc_id) {
+                    if (!deleted) {
+                        // Conflict revisions:
+                        if (!conflicts)
+                            conflicts = $marray();
+                        [conflicts addObject: [r stringForColumnIndex: 3]];
+                    }
                 }
 
                 SequenceNumber realSequence = sequence; // because sequence may be changed, below
@@ -416,8 +423,7 @@
                     CBL_FMResultSet* r2 = [fmdb executeQuery:
                                     @"SELECT revid, sequence FROM revs "
                                      "WHERE doc_id=? AND sequence<=? AND current!=0 AND deleted=0 "
-                                     "ORDER BY revID DESC "
-                                     "LIMIT 1",
+                                     "ORDER BY revID DESC",
                                     @(doc_id), @(minLastSequence)];
                     if (!r2) {
                         [r close];
@@ -445,6 +451,14 @@
                             json = [fmdb dataForQuery: @"SELECT json FROM revs WHERE sequence=?",
                                     @(sequence)];
                         }
+                        if (!deleted) {
+                            // Conflict revisions:
+                            if (!conflicts)
+                                conflicts = $marray();
+                            [conflicts addObject: oldRevID];
+                            while ([r2 next])
+                                [conflicts addObject: [r2 stringForColumnIndex:0]];
+                        }
                     }
                     [r2 close];
                 }
@@ -462,6 +476,9 @@
                     continue;
                 }
                 curDoc[@"_local_seq"] = @(sequence);
+
+                if (conflicts)
+                    curDoc[@"_conflicts"] = conflicts;
 
                 // Call the user-defined map() to emit new key/value pairs from this revision:
                 int i = -1;
@@ -689,7 +706,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
     [args addObject: @(limit)];
     [args addObject: @(options->skip)];
 
-    LogTo(View, @"Query %@: %@\n\tArguments: %@", _name, sql, args);
+    LogTo(Query, @"Query %@: %@\n\tArguments: %@", _name, sql, args);
     
     CBL_SQLiteStorage* dbStorage = _dbStorage;
     CBL_FMDatabase* fmdb = dbStorage.fmdb;
@@ -736,6 +753,8 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         // underlying query, so handle them specially:
         limit = options->limit;
         skip = options->skip;
+        if (limit == 0)
+            return queryIteratorBlockFromArray(nil); // empty result set
         options->limit = kCBLQueryOptionsDefaultLimit;
         options->skip = 0;
     }
@@ -750,7 +769,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         CBL_Revision* docRevision = nil;
         if (options->includeDocs) {
             NSDictionary* value = nil;
-            if (valueData && ![self rowValueIsEntireDoc: valueData])
+            if (valueData && !CBLQueryRowValueIsEntireDoc(valueData))
                 value = $castIf(NSDictionary, fromJSON(valueData));
             NSString* linkedID = value.cbl_id;
             if (linkedID) {
@@ -770,7 +789,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                                        json: [r dataForColumnIndex: 5]];
             }
         }
-        LogTo(ViewVerbose, @"Query %@: Found row with key=%@, value=%@, id=%@",
+        LogTo(QueryVerbose, @"Query %@: Found row with key=%@, value=%@, id=%@",
               _name, [keyData my_UTF8ToString], [valueData my_UTF8ToString],
               toJSONString(docID));
         CBLQueryRow* row;
@@ -806,7 +825,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         
         [rows addObject: row];
 
-        if (limit-- == 0)
+        if (--limit == 0)
             return 0;  // stops the iteration
         return kCBLStatusOK;
     }];
@@ -865,7 +884,10 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                                 options.fullTextQuery,
                                                 @(limit), @(options->skip)];
     if (!r) {
-        *outStatus = dbStorage.lastDbError;
+        if (dbStorage.fmdb.lastErrorCode == SQLITE_ERROR)
+            *outStatus = kCBLStatusBadRequest;      // SQLITE_ERROR means invalid FTS query string
+        else
+            *outStatus = dbStorage.lastDbError;
         return nil;
     }
     NSMutableArray* rows = [[NSMutableArray alloc] init];
@@ -1018,11 +1040,11 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
             }
             lastKeyData = [keyData copy];
         }
-        LogTo(ViewVerbose, @"Query %@: Will reduce row with key=%@, value=%@",
+        LogTo(QueryVerbose, @"Query %@: Will reduce row with key=%@, value=%@",
               _name, [keyData my_UTF8ToString], [valueData my_UTF8ToString]);
 
         id valueOrData = valueData;
-        if (valuesToReduce && [self rowValueIsEntireDoc: valueData]) {
+        if (valuesToReduce && CBLQueryRowValueIsEntireDoc(valueData)) {
             // map fn emitted 'doc' as value, which was stored as a "*" placeholder; expand now:
             CBLStatus status;
             CBL_Revision* rev = [db getDocumentWithID: docID
@@ -1042,7 +1064,7 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
         // Finish the last group (or the entire list, if no grouping):
         id key = group ? groupKey(lastKeyData, groupLevel) : $null;
         id reduced = callReduce(reduce, keysToReduce, valuesToReduce);
-        LogTo(ViewVerbose, @"Query %@: Reduced to key=%@, value=%@",
+        LogTo(QueryVerbose, @"Query %@: Reduced to key=%@, value=%@",
               _name, toJSONString(key), toJSONString(reduced));
         CBLQueryRow* row = [[CBLQueryRow alloc] initWithDocID: nil
                                                      sequence: 0
@@ -1095,16 +1117,6 @@ static CBLQueryIteratorBlock queryIteratorBlockFromArray(NSArray* rows) {
 
 - (id<CBL_QueryRowStorage>) storageForQueryRow: (CBLQueryRow*)row {
     return self;
-}
-
-
-- (BOOL) rowValueIsEntireDoc: (NSData*)valueData {
-    return valueData.length == 1 && *(const char*)valueData.bytes == '*';
-}
-
-
-- (id) parseRowValue: (NSData*)valueData {
-    return fromJSON(valueData);
 }
 
 

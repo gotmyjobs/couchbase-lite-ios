@@ -248,6 +248,29 @@
     AssertEqual(rows.nextRow.value, @[@"none"]);
     AssertEqual(rows.nextRow.value, @[@"furry"]);
     AssertNil(rows.nextRow);
+
+    // Now combine with a limit (#892):
+    query.limit = 2;
+    rows = [query run: NULL];
+
+    AssertEqual(rows.nextRow.value, @[@"scaly"]);
+    AssertEqual(rows.nextRow.value, @[@"none"]);
+    AssertNil(rows.nextRow);
+
+    // ...and a skip
+    query.skip = 1;
+    query.limit = 9;
+    rows = [query run: NULL];
+
+    AssertEqual(rows.nextRow.value, @[@"none"]);
+    AssertEqual(rows.nextRow.value, @[@"furry"]);
+    AssertNil(rows.nextRow);
+
+    // ...and skipping everything:
+    query.skip = 3;
+    rows = [query run: NULL];
+
+    AssertNil(rows.nextRow);
 }
 
 
@@ -274,15 +297,19 @@
     AssertEqual(rows.nextRow.value, @"scaly");
     AssertNil(rows.nextRow);
 
-    // Check that limits work as expected (#574):
+    // Check that limits work as expected (#574, #893):
     query = [view createQuery];
     query.postFilter = [NSPredicate predicateWithFormat: @"value endswith 'y'"];
-    query.limit = 2;
+    query.limit = 1;
     rows = [query run: NULL];
 
+    AssertEq(rows.count, 1u);
     AssertEqual(rows.nextRow.value, @"furry");
-    AssertEqual(rows.nextRow.value, @"scaly");
     AssertNil(rows.nextRow);
+
+    query.limit = 0;
+    rows = [query run: NULL];
+    AssertEq(rows.count, 0u);
 
     // Check that skip works as expected (#574):
     query = [view createQuery];
@@ -1069,6 +1096,63 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
     CBLQueryEnumerator* rows = [query run: NULL];
     AssertEq(rows.count, 40u);
     AssertEq(view.totalRows, 40u);
+}
+
+
+- (void) test22_MapFn_Conflicts {
+    CBLView* view = [db viewNamed: @"vu"];
+    Assert(view);
+    [view setMapBlock: MAPBLOCK({
+        // NSLog(@"%@", doc);
+        emit(doc[@"_id"], doc[@"_conflicts"]);
+    }) version: @"1"];
+    Assert(view.mapBlock != nil);
+
+    CBLDocument* doc = [self createDocumentWithProperties: @{@"foo": @"bar"}];
+    CBLSavedRevision* rev1 = doc.currentRevision;
+    NSMutableDictionary* properties = doc.properties.mutableCopy;
+    properties[@"tag"] = @"1";
+    NSError* error;
+    CBLSavedRevision* rev2a = [doc putProperties: properties error: &error];
+    Assert(rev2a);
+
+    // No conflicts:
+    CBLQuery* query = [view createQuery];
+    CBLQueryEnumerator* rows = [query run: NULL];
+    AssertEq(rows.count, 1u);
+    CBLQueryRow* row = [rows rowAtIndex: 0];
+    AssertEqual(row.key, doc.documentID);
+    AssertNil(row.value);
+
+    // Create a conflict revision:
+    properties = rev1.properties.mutableCopy;
+    properties[@"tag"] = @"2";
+    CBLUnsavedRevision* newRev = [rev1 createRevision];
+    newRev.properties = properties;
+    CBLSavedRevision* rev2b = [newRev saveAllowingConflict: &error];
+    Assert(rev2b);
+
+    rows = [query run: NULL];
+    AssertEq(rows.count, 1u);
+    row = [rows rowAtIndex: 0];
+    AssertEqual(row.key, doc.documentID);
+    NSArray* conflicts = @[rev2a.revisionID];
+    AssertEqual(row.value, conflicts);
+
+    // Create another conflict revision:
+    properties = rev1.properties.mutableCopy;
+    properties[@"tag"] = @"3";
+    newRev = [rev1 createRevision];
+    newRev.properties = properties;
+    CBLSavedRevision* rev2c = [newRev saveAllowingConflict: &error];
+    Assert(rev2c);
+
+    rows = [query run: NULL];
+    AssertEq(rows.count, 1u);
+    row = [rows rowAtIndex: 0];
+    AssertEqual(row.key, doc.documentID);
+    conflicts = @[rev2b.revisionID, rev2a.revisionID];
+    AssertEqual(row.value, conflicts);
 }
 
 

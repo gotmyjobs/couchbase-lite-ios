@@ -11,7 +11,9 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import "CBLCookieStorage.h"
 #import "CBL_Body.h"
+#import "CBLAttachmentDownloader.h"
 #import "MYAnonymousIdentity.h"
+#import "MYErrorUtils.h"
 
 
 // These dbs will get deleted and overwritten during tests:
@@ -42,6 +44,7 @@
     NSUInteger _expectedChangesCount;
     NSArray* _changedCookies;
     BOOL _newReplicator;
+    NSTimeInterval _timeout;
 }
 
 
@@ -64,6 +67,7 @@
         dbmgr.replicatorClassName = @"CBLBlipReplicator";
         dbmgr.dispatchQueue = dispatch_get_main_queue();
     }
+    _timeout = 15.0;
 }
 
 
@@ -79,7 +83,8 @@
 
     bool started = false, done = false;
     [repl start];
-    CFAbsoluteTime lastTime = 0;
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime lastTime = startTime;
     while (!done) {
         if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
                                       beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
@@ -93,9 +98,13 @@
         // Replication runs on a background thread, so the main runloop should not be blocked.
         // Make sure it's spinning in a timely manner:
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (lastTime > 0 && now-lastTime > 0.25)
+        if (now-lastTime > 0.25)
             Warn(@"Runloop was blocked for %g sec", now-lastTime);
         lastTime = now;
+        if (now-startTime > _timeout) {
+            XCTFail(@"...replication took too long (%.3f sec)", now-startTime);
+            return;
+        }
     }
     Log(@"...replicator finished. mode=%u, progress %u/%u, error=%@",
         repl.status, repl.completedChangesCount, repl.changesCount, repl.lastError);
@@ -124,14 +133,14 @@
                                                     name: CBLCookieStorageCookiesChangedNotification
                                                   object: nil];
 
-    Assert (expectedChangedCookies.count == _changedCookies.count);
+    AssertEq(expectedChangedCookies.count, _changedCookies.count);
     for (NSHTTPCookie* cookie in expectedChangedCookies)
         Assert([_changedCookies containsObject: cookie]);
 }
 
 
 - (void) replChanged: (NSNotification*)n {
-    Assert(n.object == _currentReplication, @"Wrong replication given to notification");
+    AssertEq(n.object, _currentReplication, @"Wrong replication given to notification");
     Log(@"Replication status=%u; completedChangesCount=%u; changesCount=%u",
         _currentReplication.status, _currentReplication.completedChangesCount, _currentReplication.changesCount);
     if (!_newReplicator) {
@@ -220,7 +229,7 @@
     NSError* error;
     __unused CBLSavedRevision *rev1 = [doc putProperties: @{@"dynamic":@1} error: &error];
     
-    Assert(!error);
+    AssertNil(error);
 
     unsigned char attachbytes[kAttSize];
     for(int i=0; i<kAttSize; i++) {
@@ -234,7 +243,7 @@
     
     [rev2 save:&error];
     
-    Assert(!error);
+    AssertNil(error);
     
     AssertEq(rev2.attachments.count, (NSUInteger)1);
     AssertEqual(rev2.attachmentNames, [NSArray arrayWithObject: @"attach"]);
@@ -261,7 +270,7 @@
     // save the updated document
     [doc putProperties: contents error: &error];
     
-    Assert(!error);
+    AssertNil(error);
     
     Log(@"Pushing 2...");
     repl = [db createPushReplication: remoteDbURL];
@@ -958,11 +967,22 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
     [self runReplication: pusher expectedChangesCount: 1];
 
     // Implicitly verify the result by checking the revpos of the document on the Sync Gateway.
-    NSURL* allDocsURL = [remoteDbURL URLByAppendingPathComponent: @"mydoc"];
-    NSData* data = [NSData dataWithContentsOfURL: allDocsURL];
-    Assert(data);
-    NSDictionary* response = [CBLJSON JSONObjectWithData: data options: 0 error: NULL];
-    NSDictionary* attachments = response[@"_attachments"];
+    __block NSDictionary* data;
+    NSURL* docUrl = [remoteDbURL URLByAppendingPathComponent: @"mydoc"];
+    XCTestExpectation* complete = [self expectationWithDescription: @"didComplete"];
+    CBLRemoteRequest *req =
+        [[CBLRemoteJSONRequest alloc] initWithMethod: @"GET" URL: docUrl
+                                                body: nil requestHeaders: nil
+                                        onCompletion:^(id result, NSError *error) {
+                                            AssertNil(error);
+                                            data = result;
+                                            [complete fulfill];
+                                        }];
+    req.debugAlwaysTrust = YES;
+    [req start];
+    [self waitForExpectationsWithTimeout: 2.0 handler: nil];
+
+    NSDictionary* attachments = data[@"_attachments"];
     Assert(attachments);
     NSDictionary* myAttachment = attachments[@"myattachment"];
     Assert(myAttachment);
@@ -1064,10 +1084,288 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
                                  return pusher.status == kCBLReplicationStopped;
                              }];
     [self waitForExpectationsWithTimeout: 5.0 handler: nil];
-    Assert(!pusher.lastError);
-    Assert(pusher.completedChangesCount == 0);
-    Assert(pusher.changesCount == 0);
+    AssertNil(pusher.lastError);
+    AssertEq(pusher.completedChangesCount, 0u);
+    AssertEq(pusher.changesCount, 0u);
     Assert(![pusher isDocumentPending: doc]);
 }
+
+
+- (void)test18_PendingDocumentIDs {
+    NSURL* remoteDbURL = [self remoteTestDBURL: kPushThenPullDBName];
+    if (!remoteDbURL)
+        return;
+    [self eraseRemoteDB: remoteDbURL];
+
+    // Push replication:
+    CBLReplication* repl = [db createPushReplication: remoteDbURL];
+    Assert(repl.pendingDocumentIDs != nil);
+    AssertEq(repl.pendingDocumentIDs.count, 0u);
+
+    [db inTransaction: ^BOOL{
+        for (int i = 1; i <= 10; i++) {
+            @autoreleasepool {
+                CBLDocument* doc = db[ $sprintf(@"doc-%d", i) ];
+                NSError* error;
+                [doc putProperties: @{@"index": @(i), @"bar": $false} error: &error];
+                AssertNil(error);
+            }
+        }
+        return YES;
+    }];
+
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [repl start];
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [self runReplication: repl expectedChangesCount: 10u];
+    Assert(repl.pendingDocumentIDs != nil);
+    AssertEq(repl.pendingDocumentIDs.count, 0u);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    // Add another set of documents and create a new replicator:
+    [db inTransaction: ^BOOL{
+        for (int i = 11; i <= 20; i++) {
+            @autoreleasepool {
+                CBLDocument* doc = db[ $sprintf(@"doc-%d", i) ];
+                NSError* error;
+                [doc putProperties: @{@"index": @(i), @"bar": $false} error: &error];
+                AssertNil(error);
+            }
+        }
+        return YES;
+    }];
+
+    repl = [db createPushReplication: remoteDbURL];
+
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-11"]]);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [repl start];
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-11"]]);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    // Pull replication:
+    repl = [db createPullReplication: remoteDbURL];
+    Assert(repl.pendingDocumentIDs == nil);
+
+    // Start and recheck:
+    [repl start];
+    Assert(repl.pendingDocumentIDs == nil);
+
+    [self runReplication: repl expectedChangesCount: 0u];
+    Assert(repl.pendingDocumentIDs == nil);
+}
+
+
+- (void) test_19_Auth_Failure {
+    _timeout = 2.0; // Failure should be immediate, with no retries
+    NSURL* remoteDbURL = [self remoteTestDBURL: @"cbl_auth_test"];
+    if (!remoteDbURL)
+        return;
+
+    CBLReplication* repl = [db createPullReplication: remoteDbURL];
+    repl.authenticator = [CBLAuthenticator basicAuthenticatorWithName: @"wrong"
+                                                             password: @"wrong"];
+    [self runReplication: repl expectedChangesCount: 0];
+    AssertEqual(repl.lastError.domain, CBLHTTPErrorDomain);
+    AssertEq(repl.lastError.code, 401);
+
+    repl.authenticator = [CBLAuthenticator OAuth1AuthenticatorWithConsumerKey: @"wrong"
+                                                               consumerSecret: @"wrong"
+                                                                        token: @"wrong"
+                                                                  tokenSecret: @"wrong"
+                                                              signatureMethod: @"PLAINTEXT"];
+    [self runReplication: repl expectedChangesCount: 0];
+    AssertEqual(repl.lastError.domain, CBLHTTPErrorDomain);
+    AssertEq(repl.lastError.code, 401);
+}
+
+
+- (CBLReplication*) pullFromAttachTest {
+    NSURL* pullURL = [self remoteTestDBURL: kAttachTestDBName];
+    if (!pullURL)
+        return nil;
+
+    CBLReplication* repl = [db createPullReplication: pullURL];
+    repl.downloadsAttachments = NO;
+    [self allowWarningsIn: ^{
+        // This triggers a warning in CBLSyncConnection because the attach-test db is actually
+        // missing an attachment body. It's not a CBL error.
+        [self runReplication: repl expectedChangesCount: 0];
+    }];
+    AssertNil(repl.lastError);
+    return repl.lastError ? nil : repl;
+}
+
+- (void) test20_LazyPullAttachments {
+    CBLReplication* repl = [self pullFromAttachTest];
+    if (!repl)
+        return;
+    Log(@"Verifying attachment...");
+    CBLDocument* doc = db[@"oneBigAttachment"];
+    CBLAttachment* att = [doc.currentRevision attachmentNamed: @"IMG_0450.MOV"];
+    Assert(att);
+    AssertEq(att.length, 34120085ul);
+    Assert(!att.contentAvailable);
+    AssertNil(att.content);
+    AssertNil(att.contentURL);
+    AssertNil(att.openContentStream);
+
+    CBLAttachmentDownloaderFakeTransientFailures = YES;
+
+    Log(@"Downloading attachment...");
+
+    XCKeyValueObservingExpectationHandler handler = ^BOOL(id observedObject, NSDictionary *change) {
+        NSProgress* p = observedObject;
+        Log(@"progress = %@", p);
+        Log(@"    desc = %@ / %@",
+            p.localizedDescription, p.localizedAdditionalDescription);
+        NSError* error = p.userInfo[kCBLProgressErrorKey];
+        return p.completedUnitCount == p.totalUnitCount || error != nil;
+    };
+
+    // Request it twice to make sure simultaneous requests work:
+    NSProgress* progress1 = [repl downloadAttachment: att];
+    NSProgress* progress2 = [repl downloadAttachment: att];
+
+    [self keyValueObservingExpectationForObject: progress1
+                                        keyPath: @"fractionCompleted"
+                                        handler: handler];
+    [self keyValueObservingExpectationForObject: progress2
+                                        keyPath: @"fractionCompleted"
+                                        handler: handler];
+    [self waitForExpectationsWithTimeout: _timeout handler: nil];
+    AssertNil(progress1.userInfo[kCBLProgressErrorKey]);
+    AssertNil(progress2.userInfo[kCBLProgressErrorKey]);
+
+    Assert(att.contentAvailable);
+    AssertEq(att.content.length, att.length);
+    Assert(att.contentURL != nil);
+    NSInputStream* stream = att.openContentStream;
+    Assert(stream != nil);
+    [stream close];
+
+    Log(@"Purging attachment...");
+    Assert([att purge]);
+    Assert(!att.contentAvailable);
+    AssertNil(att.content);
+    AssertNil(att.contentURL);
+    AssertNil(att.openContentStream);
+
+    CBLAttachmentDownloaderFakeTransientFailures = NO;
+}
+
+
+- (void) test21_LazyPullMissingAttachment {
+    CBLReplication* repl = [self pullFromAttachTest];
+    if (!repl)
+        return;
+    // This attachment has metadata, but the actual contents are missing in SG, which will cause
+    // a 404 error when we try to download it
+    CBLAttachment* att = [db[@"weirdmeta"].currentRevision attachmentNamed: @"first"];
+    Assert(att);
+
+    // Request it twice to make sure simultaneous requests work:
+    Log(@"Downloading attachment...");
+    NSProgress* progress1 = [repl downloadAttachment: att];
+    NSProgress* progress2 = [repl downloadAttachment: att];
+
+    [self keyValueObservingExpectationForObject: progress1.userInfo
+                                        keyPath: kCBLProgressErrorKey
+                                        handler: ^BOOL(id observedObject, NSDictionary *change) {
+                                            Log(@"progress1.userInfo = %@", observedObject);
+                                            return YES;
+                                        }];
+    [self keyValueObservingExpectationForObject: progress2.userInfo
+                                        keyPath: kCBLProgressErrorKey
+                                        handler: ^BOOL(id observedObject, NSDictionary *change) {
+                                            Log(@"progress2.userInfo = %@", observedObject);
+                                            return YES;
+                                        }];
+    [self waitForExpectationsWithTimeout: _timeout handler: nil];
+    NSError* error1 = progress1.userInfo[kCBLProgressErrorKey];
+    Assert([error1 my_hasDomain: CBLHTTPErrorDomain code: kCBLStatusNotFound]);
+    NSError* error2 = progress2.userInfo[kCBLProgressErrorKey];
+    Assert([error2 my_hasDomain: CBLHTTPErrorDomain code: kCBLStatusNotFound]);
+}
+
+
+- (void) test22_SyncGatewaySessionCookie {
+    NSURL* remoteURL = [self remoteTestDBURL: @"cbl_auth_test"];
+    if (!remoteURL)
+        return;
+    
+    // Get SyncGatewaySession cookie:
+    __block NSDictionary* cookie;
+    NSURLComponents* comp = [NSURLComponents componentsWithURL: remoteURL
+                                       resolvingAgainstBaseURL: YES];
+    comp.port = @(comp.port.intValue + 1); // admin port
+    comp.path = [comp.path stringByAppendingPathComponent: @"_session"];
+    XCTestExpectation* complete = [self expectationWithDescription: @"didComplete"];
+    CBLRemoteRequest *req =
+        [[CBLRemoteJSONRequest alloc] initWithMethod: @"POST"
+                                                 URL: comp.URL
+                                                body: @{@"name": @"test", @"password": @"abc123"}
+                                      requestHeaders: nil
+                                        onCompletion:^(id result, NSError *error) {
+                                            AssertNil(error);
+                                            cookie = result;
+                                            [complete fulfill];
+                                        }];
+    req.debugAlwaysTrust = YES;
+    [req start];
+    [self waitForExpectationsWithTimeout: 2.0 handler: nil];
+    
+    // Create a continuous pull replicator and set SyncGatewaySession cookie:
+    CBLReplication* repl = [db createPullReplication: remoteURL];
+    repl.continuous = YES;
+    [repl setCookieNamed: cookie[@"cookie_name"]
+               withValue: cookie[@"session_id"]
+                    path: remoteURL.path
+          expirationDate: [CBLJSON dateWithJSONObject: cookie[@"expires"]]
+                  secure: NO];
+    [self runReplication: repl expectedChangesCount: 0u];
+    AssertNil(repl.lastError);
+    
+    // Stop the pull replicator:
+    [self keyValueObservingExpectationForObject: repl
+                                        keyPath: @"status" expectedValue: @(kCBLReplicationStopped)];
+    [repl stop];
+    [self waitForExpectationsWithTimeout: 2.0 handler: nil];
+}
+
+
+- (void) test_23_StoppedWhenCloseDatabase {
+    NSURL* remoteDbURL = [self remoteTestDBURL: kPushThenPullDBName];
+    if (!remoteDbURL)
+        return;
+    [self eraseRemoteDB: remoteDbURL];
+    
+    NSError* error;
+    
+    // Run push and pull replication:
+    CBLReplication* push = [db createPushReplication: remoteDbURL];
+    push.continuous = YES;
+    [self runReplication: push expectedChangesCount: 0u];
+    
+    CBLReplication* pull = [db createPushReplication: remoteDbURL];
+    pull.continuous = YES;
+    [self runReplication: pull expectedChangesCount: 0u];
+    
+    [self keyValueObservingExpectationForObject: push keyPath: @"status" expectedValue: @(kCBLReplicationStopped)];
+    [self keyValueObservingExpectationForObject: pull keyPath: @"status" expectedValue: @(kCBLReplicationStopped)];
+    
+    Assert([db close: &error], @"Error when closing the database: %@", error);
+    
+    [self waitForExpectationsWithTimeout: 2.0 handler: nil];
+    AssertEq(db.allReplications.count, 0u);
+}
+
 
 @end

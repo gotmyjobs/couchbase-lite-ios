@@ -28,14 +28,15 @@
 #import "CBLDatabase+Insertion.h"
 #import "CBLBase64.h"
 #import "CBL_BlobStore.h"
+#import "CBL_BlobStoreWriter.h"
 #import "CBL_Attachment.h"
 #import "CBL_Body.h"
 #import "CBLMultipartWriter.h"
 #import "CBLMisc.h"
 #import "CBLInternal.h"
+#import "CBLGZip.h"
 
 #import "CollectionUtils.h"
-#import "GTMNSData+zlib.h"
 
 
 // Length that constitutes a 'big' attachment
@@ -115,7 +116,7 @@
         if (![writer install])
             return kCBLStatusAttachmentError;
         attachment.blobKey = [writer blobKey];
-        attachment.possiblyEncodedLength = [writer length];
+        attachment.possiblyEncodedLength = [writer bytesWritten];
         // Remove the writer but leave the blob-key behind for future use:
         [self rememberPendingKey: attachment.blobKey forDigest: digest];
         return kCBLStatusOK;
@@ -333,14 +334,16 @@ static UInt64 smallestLength(NSDictionary* attachment) {
             *outStatus = [self installAttachment: attachment];
             if (CBLStatusIsError(*outStatus))
                 return nil;
-        } else if ([attachInfo[@"stub"] isEqual: $true]) {
+        } else if ([attachInfo[@"stub"] isEqual: $true] && attachment->revpos < generation) {
             // "stub" on an incoming revision means the attachment is the same as in the parent.
+            // (Either that or the replicator just decided to defer downloading the attachment;
+            // that's why the 'if' above tests the revpos.)
             if (!parentAttachments && prevRevID) {
                 CBLStatus status;
                 parentAttachments = [self attachmentsForDocID: rev.docID revID: prevRevID
                                                        status: &status];
                 if (!parentAttachments) {
-                    if (status == kCBLStatusNotFound) {
+                    if (status == kCBLStatusOK || status == kCBLStatusNotFound) {
                         if ([_attachments hasBlobForKey: attachment.blobKey]) {
                             // Parent revision's body isn't known (we are probably pulling a rev along
                             // with its entire history) but it's OK, we have the attachment already
@@ -352,11 +355,12 @@ static UInt64 smallestLength(NSDictionary* attachment) {
                                                                          revpos: attachment->revpos
                                                                           docID: rev.docID
                                                                        ancestry: ancestry];
-                        if (ancestorAttachment)
+                        if (ancestorAttachment) {
+                            *outStatus = kCBLStatusOK;
                             return ancestorAttachment;
+                        } else
+                            status = kCBLStatusBadAttachment;
                     }
-                    if (status == kCBLStatusOK || status == kCBLStatusNotFound)
-                        status = kCBLStatusBadAttachment;
                     *outStatus = status;
                     return nil;
                 }
@@ -456,7 +460,7 @@ static UInt64 smallestLength(NSDictionary* attachment) {
         [self rememberAttachmentWriter: body forDigest: digest];
         NSString* encodingName = (encoding == kCBLAttachmentEncodingGZIP) ? @"gzip" : nil;
         attachments[filename] = $dict({@"digest", digest},
-                                      {@"length", @(body.length)},
+                                      {@"length", @(body.bytesWritten)},
                                       {@"follows", $true},
                                       {@"content_type", contentType},
                                       {@"encoding", encodingName});

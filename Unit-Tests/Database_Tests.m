@@ -80,8 +80,7 @@
     error = nil;
     CBLManager* copiedMgr = [dbmgr copy];
     CBLDatabase* localdb = [copiedMgr databaseNamed: dbName error: &error];
-    Assert(!error);
-    Assert(localdb);
+    Assert(localdb, @"Couldn't open db: %@", error);
 
     // Get the database from the shared manager and delete
     error = nil;
@@ -89,8 +88,7 @@
     // Close the copied manager before deleting the database
     [copiedMgr close];
     result = [localdb deleteDatabase: &error];
-    Assert(!error);
-    Assert(result);
+    Assert(result, @"Couldn't delete db: %@", error);
 
     // Check if the database still exists or not
     error = nil;
@@ -107,16 +105,14 @@
     dispatch_sync(queue, ^{
         NSError *error;
         copiedMgrDb = [copiedMgr databaseNamed: dbName error: &error];
-        Assert(!error);
-        Assert(copiedMgrDb);
+        Assert(copiedMgrDb, @"Couldn't open db: %@", error);
     });
 
     // Get the database from the shared manager and delete
     error = nil;
     localdb = [dbmgr databaseNamed: dbName error: &error];
     result = [localdb deleteDatabase: &error];
-    Assert(!error);
-    Assert(result);
+    Assert(result, @"Couldn't delete db: %@", error);
 
     // Cleanup
     dispatch_sync(queue, ^{
@@ -1047,6 +1043,10 @@
     NSError* error;
     CBLDatabase* replaceDb = [dbmgr existingDatabaseNamed: name error: &error];
     Assert(replaceDb, @"Couldn't find the replaced database named %@ : %@", name, error);
+
+    NSString* storageType = NSStringFromClass(replaceDb.storage.class);
+    AssertEqual(storageType, (self.isSQLiteDB ? @"CBL_SQLiteStorage" : @"CBL_ForestDBStorage"));
+
     CBLView* view = [replaceDb viewNamed: @"myview"];
     Assert(view);
     [view setMapBlock: MAPBLOCK({
@@ -1057,7 +1057,7 @@
     query.prefetch = YES;
     Assert(query);
     CBLQueryEnumerator* rows = [query run: &error];
-    Assert(rows, @"Could query the replaced database named %@ : %@", name, error);
+    Assert(rows, @"Couldn't query the replaced database named %@ : %@", name, error);
 
     onComplete(rows);
 }
@@ -1073,9 +1073,9 @@
 }
 
 - (void) test23_ReplaceOldVersionDatabase {
-    // Test only SQLite:
-    if (!self.isSQLiteDB)
-        return;
+    // During the SQLite phase, this just tests copying the db and upgrading to 1.1 format.
+    // During the ForestDB phase, the databases will also be upgraded to ForestDB.
+    dbmgr.upgradeStorage = YES;
 
     // iOS 1.0.4
     NSString* dbFile = [self pathToReplaceDbFile: @"iosdb.cblite" inDirectory: @"ios104"];
@@ -1184,5 +1184,33 @@
                         }];
 }
 
+
+- (void) test24_CloseDatabase {
+    // Add some documents:
+    for (NSUInteger i = 0; i < 10; i++) {
+        CBLDocument* doc = [db createDocument];
+        CBLSavedRevision* rev = [doc putProperties: @{@"foo": @"bar"} error: nil];
+        Assert(rev);
+    }
+    
+    // Use the background database:
+    __block CBLDatabase* bgdb;
+    XCTestExpectation* expectation =
+        [self expectationWithDescription: @"Adding a document in background"];
+    [dbmgr backgroundTellDatabaseNamed: db.name to: ^(CBLDatabase *_bgdb) {
+        bgdb = _bgdb;
+        CBLDocument* doc = [_bgdb createDocument];
+        CBLSavedRevision* rev = [doc putProperties: @{@"foo": @"bar"} error: nil];
+        [expectation fulfill];
+        Assert(rev);
+    }];
+    [self waitForExpectationsWithTimeout: 1.0 handler: nil];
+    
+    // Close database:
+    NSError* error;
+    [self keyValueObservingExpectationForObject: bgdb keyPath: @"isOpen" expectedValue: @(NO)];
+    Assert([db close: &error], @"Cannot close the database: %@", error);
+    [self waitForExpectationsWithTimeout: 1.0 handler: nil];
+}
 
 @end

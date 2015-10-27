@@ -30,12 +30,13 @@
 {
     NSMutableArray* _changes;
     BOOL _running, _finished;
+    BOOL _gotHeaders;
 }
 
 - (void) test_Simple {
     for (CBLChangeTrackerMode mode = kOneShot; mode <= kLongPoll; ++mode) {
         Log(@"Mode = %d ...", mode);
-        NSURL* url = [self remoteTestDBURL: @"attach_test"];
+        NSURL* url = [self remoteNonSSLTestDBURL: @"attach_test"];
         if (!url)
             return;
         CBLChangeTracker* tracker = [[CBLChangeTracker alloc] initWithDatabaseURL: url mode: mode conflicts: NO lastSequence: nil client: self];
@@ -63,6 +64,7 @@
                                          {@"revs", $array(@"2-116dc4ccc934971ae14d8a8afb29b023")})
                                    );
         [self run: tracker expectingChanges: expected];
+        Assert(_gotHeaders);
     }
 }
 
@@ -105,13 +107,14 @@
                                );
     [self run: tracker expectingChanges: expected];
     Assert(self.checkedAnSSLCert);
+    Assert(_gotHeaders);
 }
 
 
 - (void) test_Auth {
     RequireTestCase(AuthFailure);
     // This database requires authentication to access at all.
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url)
         return;
 
@@ -126,11 +129,12 @@
                                      {@"revs", $array(@"1-53b059eb633a9d58042318e478cc73dc")}) );
     [self run: tracker expectingChanges: expected];
     RemoveTemporaryCredential(url, @"Couchbase Sync Gateway", @"test", @"abc123");
+    Assert(_gotHeaders);
 }
 
 
 - (void) test_AuthFailure {
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url)
         return;
     // Add a bogus user to make auth fail:
@@ -148,7 +152,7 @@
 
 - (void) test_CBLWebSocketChangeTracker_Auth {
     // This Sync Gateway database requires authentication to access at all.
-    NSURL* url = [self remoteTestDBURL: @"cbl_auth_test"];
+    NSURL* url = [self remoteNonSSLTestDBURL: @"cbl_auth_test"];
     if (!url) {
         Warn(@"Skipping test; no remote DB URL configured");
         return;
@@ -244,6 +248,11 @@
     Assert(!_running, @"-changeTrackerStoped: wasn't called");
     AssertEqual(tracker.error.domain, error.domain);
     AssertEq(tracker.error.code, error.code);
+}
+
+- (void) changeTrackerReceivedHTTPHeaders:(NSDictionary *)headers {
+    _gotHeaders = YES;
+    Assert([headers[@"Server"] hasPrefix: @"Couchbase Sync Gateway"]);
 }
 
 - (void) changeTrackerReceivedSequence:(id)sequence

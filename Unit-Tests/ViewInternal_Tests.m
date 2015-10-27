@@ -155,16 +155,26 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     [self putDoc: $dict({@"_id", @"_design/foo"})];
     [self putDoc: $dict({@"clef", @"quatre"})];
     
-    CBLView* view = [self createView];
+    CBLView* view = [db viewNamed: @"aview"];
+    [view setMapBlock: MAPBLOCK({
+        Assert(doc[@"_id"] != nil, @"Missing _id in %@", doc);
+        Assert(doc[@"_rev"] != nil, @"Missing _rev in %@", doc);
+        Assert([doc[@"_local_seq"] isKindOfClass: [NSNumber class]], @"Invalid _local_seq in %@", doc);
+        Assert(![doc[@"_id"] hasPrefix:@"_design/"], @"Shouldn't index the design doc: %@", doc);
+        if (doc[@"key"])
+            emit(doc[@"key"], @([doc[@"key"] length]));
+        if (doc[@"geoJSON"])
+            emit(CBLGeoJSONKey(doc[@"geoJSON"]), nil);
+    }) reduceBlock: NULL version: @"1"];
 
     Assert(view.stale);
     AssertEq([view updateIndex], kCBLStatusOK);
     
     NSArray* dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"one\""}, {@"seq", @1}),
-                              $dict({@"key", @"\"three\""}, {@"seq", @3}),
-                              $dict({@"key", @"\"two\""}, {@"seq", @2}) ));
+    AssertEqual(dump, $array($dict({@"key", @"\"one\""},   {@"value", @"3"}, {@"seq", @1}),
+                             $dict({@"key", @"\"three\""}, {@"value", @"5"}, {@"seq", @3}),
+                             $dict({@"key", @"\"two\""},   {@"value", @"3"}, {@"seq", @2}) ));
     // No-op reindex:
     Assert(!view.stale);
     AssertEq([view updateIndex], kCBLStatusNotModified);
@@ -193,16 +203,16 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"3hree\""}, {@"seq", @6}),
-                              $dict({@"key", @"\"four\""}, {@"seq", @7}),
-                              $dict({@"key", @"\"one\""}, {@"seq", @1}) ));
+    AssertEqual(dump, $array($dict({@"key", @"\"3hree\""}, {@"value", @"5"}, {@"seq", @6}),
+                              $dict({@"key", @"\"four\""}, {@"value", @"4"}, {@"seq", @7}),
+                              $dict({@"key", @"\"one\""},  {@"value", @"3"}, {@"seq", @1}) ));
     
     // Now do a real query:
     NSArray* rows = rowsToDicts([view _queryWithOptions: NULL status: &status]);
     AssertEq(status, kCBLStatusOK);
-    AssertEqual(rows, $array( $dict({@"key", @"3hree"}, {@"id", rev3.docID}),
-                               $dict({@"key", @"four"}, {@"id", rev4.docID}),
-                               $dict({@"key", @"one"}, {@"id", rev1.docID}) ));
+    AssertEqual(rows, $array( $dict({@"key", @"3hree"}, {@"value", @5}, {@"id", rev3.docID}),
+                               $dict({@"key", @"four"}, {@"value", @4}, {@"id", rev4.docID}),
+                               $dict({@"key", @"one"},  {@"value", @3}, {@"id", rev1.docID}) ));
     
     [view deleteIndex];
 }
@@ -242,6 +252,13 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 }
 
 
+static NSArray* sortViews(NSArray *array) {
+    return [array sortedArrayUsingComparator:^NSComparisonResult(CBLView* a, CBLView* b) {
+        return [a.name compare: b.name];
+    }];
+}
+
+
 - (void) test04_IndexMultiple {
     RequireTestCase(Index);
 
@@ -254,12 +271,12 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     [vX forgetMapBlock]; // To reproduce #438
 
-    AssertEqual(v1.viewsInGroup, (@[v1]));
-    AssertEqual(v2.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(v3.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(vX.viewsInGroup, (@[v2, v3, vX]));
-    AssertEqual(v4.viewsInGroup, (@[v4])); // because GROUP_VIEWS_BY_DEFAULT isn't enabled
-    AssertEqual(v5.viewsInGroup, (@[v5]));
+    AssertEqual(sortViews(v1.viewsInGroup), (@[v1]));
+    AssertEqual(sortViews(v2.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(v3.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(vX.viewsInGroup), (@[v2, v3, vX]));
+    AssertEqual(sortViews(v4.viewsInGroup), (@[v4])); // because GROUP_VIEWS_BY_DEFAULT isn't enabled
+    AssertEqual(sortViews(v5.viewsInGroup), (@[v5]));
 
     const int kNDocs = 10;
     for (int i=0; i<kNDocs; i++) {
@@ -552,6 +569,48 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual(rows, expectedRows);
 }
 
+- (void) test08a_QueryOpenEnded {
+    RequireTestCase(Index);
+    [self putDocs];
+    CBLView* view = [self createView];
+    AssertEq([view updateIndex], kCBLStatusOK);
+    CBLQueryOptions *options = [CBLQueryOptions new];
+    CBLStatus status;
+    NSArray *rows, *expectedRows;
+
+    // Start, no end:
+    options.startKey = @"g";
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"11111"}, {@"key", @"one"}),
+                          $dict({@"id",  @"33333"}, {@"key", @"three"}),
+                          $dict({@"id",  @"22222"}, {@"key", @"two"}));
+    AssertEqual(rows, expectedRows);
+
+    // Start, no end, descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"44444"}, {@"key", @"four"}),
+                          $dict({@"id",  @"55555"}, {@"key", @"five"}));
+    AssertEqual(rows, expectedRows);
+
+    // End, no start:
+    options = [CBLQueryOptions new];
+    options.endKey = @"g";
+    options->descending = NO;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"55555"}, {@"key", @"five"}),
+                          $dict({@"id",  @"44444"}, {@"key", @"four"}));
+    AssertEqual(rows, expectedRows);
+
+    // End, no start, descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    expectedRows = $array($dict({@"id",  @"22222"}, {@"key", @"two"}),
+                          $dict({@"id",  @"33333"}, {@"key", @"three"}),
+                          $dict({@"id",  @"11111"}, {@"key", @"one"}));
+    AssertEqual(rows, expectedRows);
+}
+
 - (void) test09_QueryStartKeyDocID {
     RequireTestCase(Query);
     [self putDocs];
@@ -600,7 +659,7 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 
     NSArray* dump = [view.storage dump];
     Log(@"View dump: %@", dump);
-    AssertEqual(dump, $array($dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-1"}),
+    AssertEqualish(dump, $array($dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-1"}),
                               $dict({@"key", @"\"five\""}, {@"seq", @5}, {@"value", @"-2"}),
                               $dict({@"key", @"\"four\""}, {@"seq", @2}, {@"value", @"-1"}),
                               $dict({@"key", @"\"four\""}, {@"seq", @2}, {@"value", @"-2"}),
@@ -620,21 +679,61 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     AssertEqual(rows, expectedRows);
 }
 
-- (void) test11_PrefixMatch {
+static NSArray* reverse(NSArray* a) {
+    return a.reverseObjectEnumerator.allObjects;
+}
+
+- (void) test11a_PrefixMatchStrings {
     RequireTestCase(Query);
     [self putDocs];
     CBLView* view = [self createView];
     AssertEq([view updateIndex], kCBLStatusOK);
 
-    // Query all rows:
+    // Keys with prefix "f":
     CBLQueryOptions *options = [CBLQueryOptions new];
     CBLStatus status;
+    options.startKey = @"f";
     options.endKey = @"f";
     options->prefixMatchLevel = 1;
     NSArray* rows = rowsToDicts([view _queryWithOptions: options status: &status]);
     NSArray* expectedRows = $array($dict({@"id",  @"55555"}, {@"key", @"five"}),
                                    $dict({@"id",  @"44444"}, {@"key", @"four"}));
     AssertEqual(rows, expectedRows);
+
+    // ...descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    AssertEqual(rows, reverse(expectedRows));
+
+    // TODO: Test prefixMatchLevel > 1
+}
+
+- (void) test11b_PrefixMatchArrays {
+    RequireTestCase(Query);
+    [self putDocs];
+    CBLView* view = [db viewNamed: @"view"];
+    [view setMapBlock: MAPBLOCK({
+        int i = [doc[@"_id"] intValue];
+        emit(@[doc[@"key"], @(i)], nil);
+        emit(@[doc[@"key"], @(i/100)], nil);
+    }) reduceBlock: NULL version: @"1"];
+    AssertEq([view updateIndex], kCBLStatusOK);
+
+    // Keys starting with "one":
+    CBLQueryOptions *options = [CBLQueryOptions new];
+    CBLStatus status;
+    options.startKey = options.endKey = @[@"one"];
+    options->prefixMatchLevel = 1;
+    NSArray* rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    NSArray* expectedRows = $array($dict({@"id",  @"11111"}, {@"key", @[@"one", @111]}),
+                                   $dict({@"id",  @"11111"}, {@"key", @[@"one", @11111]}));
+    AssertEqual(rows, expectedRows);
+
+    // ...descending:
+    options->descending = YES;
+    rows = rowsToDicts([view _queryWithOptions: options status: &status]);
+    AssertEqual(rows, reverse(expectedRows));
+
     // TODO: Test prefixMatchLevel > 1
 }
 
@@ -712,8 +811,6 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
 }
 
 - (void) test14_GeoQuery {
-    if (!self.isSQLiteDB)
-        return; //FIX: ForestDB doesn't support nontrivial geo queries (#485)
     RequireTestCase(CBLGeometry);
     RequireTestCase(Index);
     [self putGeoDocs];
@@ -1216,6 +1313,23 @@ static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iter
     // Make sure the deleted doc doesn't still show up in the query results:
     rows = [[query run: NULL] allObjects];
     AssertEq(rows.count, 0u);
+
+    // Make sure an empty FTS query returns an empty result set: (#840)
+    query = [view createQuery];
+    query.fullTextQuery = @"";
+    rows = [[query run: &error] allObjects];
+    AssertEqual(rows, @[]);
+    AssertNil(error);
+
+    // Make sure SQLite rejects invalid FTS query strings with an error: (#840)
+    if (self.isSQLiteDB) {
+        query = [view createQuery];
+        query.fullTextQuery = @"\"";
+        error = nil;
+        CBLQueryEnumerator* e = [query run: &error];
+        AssertNil(e);
+        AssertEq(error.code, 400);
+    }
 }
 
 

@@ -86,8 +86,50 @@
 }
 
 
+- (instancetype) initWithKeyOrPassword: (id)keyOrPassword {
+    if ([keyOrPassword isKindOfClass: [NSString class]]) {
+        return [self initWithPassword: keyOrPassword];
+    } else {
+        Assert([keyOrPassword isKindOfClass: [NSData class]], @"Key must be NSString or NSData");
+        return [self initWithKeyData: keyOrPassword];
+    }
+}
+
+
+- (instancetype) initWithKeychainItemNamed: (NSString*)itemName
+                                     error: (NSError**)outError
+{
+    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: itemName,
+                            (__bridge id)kSecReturnData: @YES,
+                            };
+    CFTypeRef cfData = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &cfData);
+    if (status == noErr) {
+        self = [self initWithKeyData: CFBridgingRelease(cfData)];
+        if (self)
+            return self;    // success!
+        status = errSecDecode; // data is not a valid AES key
+    }
+    if (outError)
+        *outError = [NSError errorWithDomain: NSOSStatusErrorDomain code: status userInfo: nil];
+    return nil;
+}
+
+
 - (NSString*) hexData {
     return CBLHexFromBytes(_keyData.bytes, _keyData.length);
+}
+
+
+- (BOOL) saveKeychainItemNamed: (NSString*)itemName {
+    NSDictionary *attrs = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: itemName,
+                            (__bridge id)kSecValueData: _keyData};
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)attrs, NULL);
+    if (status != noErr)
+        Warn(@"CBLSymmetricKey: SecItemAdd returned %d", (int)status);
+    return (status == noErr);
 }
 
 

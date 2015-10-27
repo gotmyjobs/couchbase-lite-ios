@@ -18,11 +18,12 @@
 #import "CBLRevision.h"
 #import "CBLDatabaseChange.h"
 #import "CBL_BlobStore.h"
+#import "CBL_BlobStoreWriter.h"
 #import "CBLBase64.h"
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
 #import "CouchbaseLitePrivate.h"
-#import "GTMNSData+zlib.h"
+#import "CBLGZip.h"
 
 
 @interface DatabaseAttachment_Tests : CBLTestCaseWithDB
@@ -184,7 +185,7 @@
     if (compress) {
         length = @(attachmentData.length);
         encoding = @"gzip";
-        attachmentData = [NSData gtm_dataByGzippingData: attachmentData];
+        attachmentData = [CBLGZip dataByCompressingData: attachmentData];
     }
     NSString* base64 = [CBLBase64 encode: attachmentData];
     NSDictionary* attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
@@ -348,7 +349,7 @@
                             status: &status],
            @"expandAttachments failed: status %d", status);
 
-    NSString* encoded = [CBLBase64 encode: [NSData gtm_dataByGzippingData: [bodyString dataUsingEncoding: NSUTF8StringEncoding]]];
+    NSString* encoded = [CBLBase64 encode: [CBLGZip dataByCompressingData: [bodyString dataUsingEncoding: NSUTF8StringEncoding]]];
     AssertEqual(expandedRev[@"_attachments"],
                 $dict({@"attach", $dict({@"content_type", @"text/plain"},
                                         {@"digest", @"sha1-Wk8g89eb0Y+5DtvMKkf+/g90Mhc="},
@@ -477,7 +478,7 @@
                             decode: NO
                             status: &status],
            @"expandAttachments failed: status %d", status);
-    NSData* zipped = [NSData gtm_dataByGzippingData: [attachStr dataUsingEncoding: NSUTF8StringEncoding]];
+    NSData* zipped = [CBLGZip dataByCompressingData: [attachStr dataUsingEncoding: NSUTF8StringEncoding]];
     Assert(zipped.length < 1024); // needs to be short for this test
     NSString* base64 = [CBLBase64 encode: zipped];
     AssertEqualish(expandedRev[@"_attachments"],
@@ -526,9 +527,74 @@
 }
 
 
+- (void) test16_IntermediateDeletedRevs {
+    // Put a revision that includes an _attachments dict:
+    NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
+    NSString* base64 = [CBLBase64 encode: attach1];
+    NSDictionary* attachmentDict = $dict({@"attach", $dict({@"content_type", @"text/plain"},
+                                                           {@"data", base64})});
+    NSDictionary* props = $dict({@"_id", @"X"},
+                                {@"_attachments", attachmentDict});
+    CBL_Revision* rev1;
+    CBLStatus status;
+    NSError* error;
+    rev1 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props]
+            prevRevisionID: nil allowConflict: NO status: &status error: &error];
+    AssertEq(status, kCBLStatusCreated);
+    AssertNil(error);
+    AssertEqual(rev1[@"_attachments"][@"attach"][@"revpos"], @1);
+
+    // Insert a delete rev:
+    props = $dict({@"_id", rev1.docID},
+                  {@"_deleted", $true});
+    CBL_Revision* rev2;
+    rev2 = [db putRevision: [CBL_MutableRevision revisionWithProperties: props] prevRevisionID:
+            rev1.revID allowConflict: NO status: &status error: &error] ;
+    AssertEq(status, kCBLStatusOK);
+    AssertNil(error);
+    Assert(rev2.deleted);
+
+    // Insert a revision several generations advanced but which hasn't changed the attachment:
+    CBL_MutableRevision* rev3 = [rev1 mutableCopy];
+    rev3[@"_rev"] = @"3-3333";
+    rev3[@"foo"] = @"bar";
+    [rev3 mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *att) {
+        NSMutableDictionary* nuAtt = [att mutableCopy];
+        [nuAtt removeObjectForKey: @"data"];
+        nuAtt[@"stub"] = @YES;
+        nuAtt[@"digest"] = @"md5-deadbeef";     // CouchDB adds MD5 digests!
+        return nuAtt;
+    }];
+    NSArray* history = @[rev2.revID, rev1.revID];
+    status = [db forceInsert: rev3 revisionHistory: history source: nil error: &error];
+    AssertEq(status, 200);
+}
+
+
+- (void) test17_FollowWithRevpos {
+    NSDictionary* attachInfo = $dict({@"content_type", @"text/plain"},
+                                     {@"digest", @"md5-DaUdFsLh8FKLbcBIDlU57g=="},
+                                     {@"follows", @YES},
+                                     {@"length", @51200},
+                                     {@"revpos", @2});
+    CBLStatus status;
+    CBL_Attachment *attachment = [[CBL_Attachment alloc] initWithName: @"attachment"
+                                                                 info: attachInfo
+                                                               status: &status];
+    Assert(attachment);
+    Assert(status != kCBLStatusBadAttachment);
+    NSDictionary* stub = [attachment asStubDictionary];
+    AssertEqualish(stub, $dict({@"content_type", @"text/plain"},
+                               {@"digest", @"sha1-AAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+                               {@"length", @51200},
+                               {@"revpos", @2},
+                               {@"stub", @YES}));
+}
+
+
 static NSDictionary* attachmentsDict(NSData* data, NSString* name, NSString* type, BOOL gzipped) {
     if (gzipped)
-        data = [NSData gtm_dataByGzippingData: data];
+        data = [CBLGZip dataByCompressingData: data];
     NSMutableDictionary* att = $mdict({@"content_type", type}, {@"data", data});
     if (gzipped)
         att[@"encoding"] = @"gzip";

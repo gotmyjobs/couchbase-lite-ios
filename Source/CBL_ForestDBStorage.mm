@@ -22,7 +22,10 @@ extern "C" {
 #import "CBL_Attachment.h"
 #import "CBLBase64.h"
 #import "CBLMisc.h"
+#import "CBLSymmetricKey.h"
 #import "ExceptionUtils.h"
+#import "MYAction.h"
+#import "MYBackgroundMonitor.h"
 }
 #import <CBForest/CBForest.hh>
 #import "CBLForestBridge.h"
@@ -39,22 +42,31 @@ using namespace forestdb;
 #define kDBWALThreshold 1024
 
 // How often ForestDB should check whether databases need auto-compaction
-#define kAutoCompactInterval (5*60.0)
+#define kAutoCompactInterval (15.0)
+
+// Percentage of wasted space in db file that triggers auto-compaction
+#define kCompactionThreshold 70
 
 #define kDefaultMaxRevTreeDepth 20
+
+
+using namespace couchbase_lite;
 
 
 @implementation CBL_ForestDBStorage
 {
     @private
     NSString* _directory;
+    Database::config _config;
     Database* _forest;
     Transaction* _forestTransaction;
     KeyStore* _localDocs;
     int _transactionLevel;
+    NSMapTable* _views;
 }
 
-@synthesize delegate=_delegate, directory=_directory, autoCompact=_autoCompact, maxRevTreeDepth=_maxRevTreeDepth;
+@synthesize delegate=_delegate, directory=_directory, autoCompact=_autoCompact;
+@synthesize maxRevTreeDepth=_maxRevTreeDepth, encryptionKey=_encryptionKey;
 
 
 static void FDBLogCallback(forestdb::logLevel level, const char *message) {
@@ -77,15 +89,83 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 }
 
 
+#ifdef TARGET_OS_IPHONE
+static MYBackgroundMonitor *bgMonitor;
+#endif
+
+
+static void onCompactCallback(Database *db, bool compacting) {
+    const char *what = (compacting ?"starting" :"finished");
+    NSString* path = [[NSString alloc] initWithCString: db->filename().c_str()
+                                              encoding: NSUTF8StringEncoding];
+    NSString* viewName = path.lastPathComponent;
+    path = path.stringByDeletingLastPathComponent;
+    NSString* dbName = path.lastPathComponent.stringByDeletingPathExtension;
+    if ([viewName isEqualToString: kDBFilename]) {
+        Log(@"Database '%@' %s compaction", dbName, what);
+    } else {
+        dbName = [dbName stringByAppendingPathComponent: viewName];
+        Log(@"View index '%@/%@' %s compaction",
+            dbName, viewName.stringByDeletingPathExtension, what);
+    }
+}
+
+
 + (void) initialize {
     if (self == [CBL_ForestDBStorage class]) {
+        Log(@"Initializing ForestDB");
         forestdb::LogCallback = FDBLogCallback;
         if (WillLogTo(CBLDatabaseVerbose))
             forestdb::LogLevel = kDebug;
         else if (WillLogTo(CBLDatabase))
             forestdb::LogLevel = kInfo;
+
+        Database::onCompactCallback = onCompactCallback;
+
+        // Initialize ForestDB global config settings:
+        auto config = Database::defaultConfig();
+        config.buffercache_size = kDBBufferCacheSize;
+        config.wal_threshold = kDBWALThreshold;
+        config.wal_flush_before_commit = true;
+        config.compress_document_body = true;
+        config.multi_kv_instances = true;
+        config.compaction_threshold = kCompactionThreshold;
+        config.compactor_sleep_duration = (uint64_t)kAutoCompactInterval;
+        config.num_compactor_threads = 1;
+        config.num_bgflusher_threads = 1;
+        Database::setDefaultConfig(config);
+
+#if TARGET_OS_IPHONE
+        bgMonitor = [[MYBackgroundMonitor alloc] init];
+        bgMonitor.onAppBackgrounding = ^{
+            if ([self checkStillCompacting])
+                [bgMonitor beginBackgroundTaskNamed: @"Database compaction"];
+        };
+        bgMonitor.onAppForegrounding = ^{
+            [self cancelPreviousPerformRequestsWithTarget: self
+                                                 selector: @selector(checkStillCompacting)
+                                                   object: nil];
+        };
+#endif
     }
 }
+
+
+#if TARGET_OS_IPHONE
++ (BOOL) checkStillCompacting {
+    if (Database::isAnyCompacting()) {
+        Log(@"Database still compacting; delaying app suspend...");
+        [self performSelector: @selector(checkStillCompacting) withObject: nil afterDelay: 0.5];
+        return YES;
+    } else {
+        if (bgMonitor.hasBackgroundTask) {
+            Log(@"Database finished compacting; allowing app to suspend.");
+            [bgMonitor endBackgroundTask];
+        }
+        return NO;
+    }
+}
+#endif
 
 
 - (instancetype) init {
@@ -98,8 +178,17 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 }
 
 
+- (NSString*) description {
+    return [NSString stringWithFormat: @"%@[%@]", self.class, _directory];
+}
+
+
 - (BOOL) databaseExistsIn: (NSString*)directory {
     NSString* dbPath = [directory stringByAppendingPathComponent: kDBFilename];
+    if ([[NSFileManager defaultManager] fileExistsAtPath: dbPath isDirectory: NULL])
+        return YES;
+    // If "db.forest" doesn't exist (auto-compaction will add numeric suffixes), check for meta:
+    dbPath = [dbPath stringByAppendingString: @".meta"];
     return [[NSFileManager defaultManager] fileExistsAtPath: dbPath isDirectory: NULL];
 }
 
@@ -109,34 +198,26 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
                 manager: (CBLManager*)manager
                   error: (NSError**)outError
 {
-    if (_delegate.encryptionKey)
-        return CBLStatusToOutNSError(kCBLStatusNotImplemented, outError);
-
     _directory = [directory copy];
-    NSString* forestPath = [directory stringByAppendingPathComponent: kDBFilename];
     fdb_open_flags flags = readOnly ? FDB_OPEN_FLAG_RDONLY : FDB_OPEN_FLAG_CREATE;
 
-    Database::config config = Database::defaultConfig();
-    config.flags = flags;
-    config.buffercache_size = kDBBufferCacheSize;
-    config.wal_threshold = kDBWALThreshold;
-    config.wal_flush_before_commit = true;
-    config.seqtree_opt = true;
-    config.compress_document_body = true;
-    if (_autoCompact) {
-        config.compactor_sleep_duration = (uint64_t)kAutoCompactInterval;
-    } else {
-        config.compaction_threshold = 0; // disables auto-compact
-    }
+    _config = Database::defaultConfig(); // Default config is set in +initialize, above
+    _config.flags = flags;
+    _config.seqtree_opt = true;
+    _config.compaction_mode = _autoCompact ? FDB_COMPACTION_AUTO : FDB_COMPACTION_MANUAL;
+    return [self reopen: outError];
+}
 
-    try {
-        _forest = new Database(std::string(forestPath.fileSystemRepresentation), config);
-    } catch (forestdb::error err) {
-        return CBLStatusToOutNSError(CBLStatusFromForestDBStatus(err.status), outError);
-    } catch (...) {
-        return CBLStatusToOutNSError(kCBLStatusException, outError);
-    }
-    return YES;
+
+- (BOOL) reopen: (NSError**)outError {
+    if (_encryptionKey)
+        LogTo(CBLDatabase, @"Database is encrypted; setting CBForest encryption key");
+    NSString* forestPath = [_directory stringByAppendingPathComponent: kDBFilename];
+    _forest = [CBLForestBridge openDatabaseAtPath: forestPath
+                                       withConfig: _config
+                                    encryptionKey: _encryptionKey
+                                            error: outError];
+    return (_forest != NULL);
 }
 
 
@@ -146,6 +227,41 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
     delete _forest;
     _forest = NULL;
     _transactionLevel = 0;
+}
+
+
+- (MYAction*) actionToChangeEncryptionKey: (CBLSymmetricKey*)newKey {
+    MYAction* action = [MYAction new];
+
+    // Re-key the views!
+    NSArray* viewNames = self.allViewNames;
+    for (NSString* viewName in viewNames) {
+        CBL_ForestDBViewStorage* viewStorage = [self viewStorageNamed: viewName create: YES];
+        [action addAction: [viewStorage actionToChangeEncryptionKey]];
+    }
+
+    // Re-key the database:
+    CBLSymmetricKey* oldKey = _encryptionKey;
+    [action addPerform: ^BOOL(NSError **outError) {
+        return tryError(outError, ^{
+            fdb_encryption_key enc;
+            [CBLForestBridge setEncryptionKey: &enc fromSymmetricKey: newKey];
+            _forest->rekey(enc);
+            self.encryptionKey = newKey;
+        });
+    } backOut:^BOOL(NSError **outError) {
+        return tryError(outError, ^{
+            fdb_encryption_key enc;
+            [CBLForestBridge setEncryptionKey: &enc fromSymmetricKey: _encryptionKey];
+            //FIX: This can potentially fail. If it did, the database would be lost.
+            // It would be safer to save & restore the old db file, the one that got replaced
+            // during rekeying, but the ForestDB API doesn't allow preserving it...
+            _forest->rekey(enc);
+            self.encryptionKey = oldKey;
+        });
+    } cleanUp: nil];
+
+    return action;
 }
 
 
@@ -174,26 +290,11 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 
 
 - (BOOL) compact: (NSError**)outError {
-    CBLStatus status = [self _try: ^{
+    CBLStatus status = tryStatus(^{
         _forest->compact();
         return kCBLStatusOK;
-    }];
+    });
     return CBLStatusToOutNSError(status, outError);
-}
-
-
-- (CBLStatus) _try: (CBLStatus(^)())block {
-    try {
-        return block();
-    } catch (forestdb::error err) {
-        return CBLStatusFromForestDBStatus(err.status);
-    } catch (NSException* x) {
-        MYReportException(x, @"CBL_ForestDBStorage");
-        return kCBLStatusException;
-    } catch (...) {
-        Warn(@"Unknown C++ exception caught in CBL_ForestDBStorage");
-        return kCBLStatusException;
-    }
 }
 
 
@@ -203,9 +304,9 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
         _forestTransaction = new Transaction(_forest);
     }
 
-    CBLStatus status = [self _try: ^CBLStatus{
+    CBLStatus status = tryStatus(^CBLStatus{
         return block();
-    }];
+    });
     BOOL commit = !CBLStatusIsError(status);
 
     LogTo(CBLDatabase, @"END transaction (status=%d)", status);
@@ -230,12 +331,12 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 - (CBLStatus) _withVersionedDoc: (NSString*)docID
                              do: (CBLStatus(^)(VersionedDocument&))block
 {
-    return [self _try: ^{
+    return tryStatus(^{
         VersionedDocument doc(*_forest, docID);
         if (!doc.exists())
             return kCBLStatusNotFound;
         return block(doc);
-    }];
+    });
 }
 
 
@@ -266,18 +367,19 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 }
 
 
-- (CBL_MutableRevision*) getDocumentWithID: (NSString*)docID
-                                  sequence: (SequenceNumber)sequence
-                                    status: (CBLStatus*)outStatus
+- (NSDictionary*) getBodyWithID: (NSString*)docID
+                       sequence: (SequenceNumber)sequence
+                         status: (CBLStatus*)outStatus
 {
-    __block CBL_MutableRevision* result = nil;
+    __block NSDictionary* result = nil;
     *outStatus = [self _withVersionedDoc: docID do: ^(VersionedDocument& doc) {
 #if DEBUG
         LogTo(CBLDatabase, @"Read %s", doc.dump().c_str());
 #endif
-        result = [CBLForestBridge revisionObjectFromForestDoc: doc
-                                                     sequence: sequence
-                                                     withBody: YES];
+        const Revision* revNode = doc.getBySequence(sequence);
+        if (!revNode)
+            return kCBLStatusNotFound;
+        result = [CBLForestBridge bodyOfNode: revNode];
         return result ? kCBLStatusOK : kCBLStatusNotFound;
     }];
     return result;
@@ -435,20 +537,18 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
     forestOpts.limit = options->limit;
     forestOpts.inclusiveEnd = YES;
     forestOpts.includeDeleted = NO;
-    BOOL withBody = (options->includeDocs || filter != nil);
+    BOOL withBody = (options->includeDocs || options->includeConflicts || filter != nil);
     if (!withBody)
         forestOpts.contentOptions = Database::kMetaOnly;
 
     CBL_RevisionList* changes = [[CBL_RevisionList alloc] init];
-    *outStatus = [self _try: ^CBLStatus{
+    *outStatus = tryStatus(^CBLStatus{
         for (DocEnumerator e(*_forest, lastSequence+1, UINT64_MAX, forestOpts); e.next(); ) {
             @autoreleasepool {
                 VersionedDocument doc(*_forest, *e);
                 NSArray* revIDs;
-                if (options->includeConflicts && doc.isConflicted()) {
-                    if (forestOpts.contentOptions & Database::kMetaOnly)
-                        doc.read();
-                    revIDs = [CBLForestBridge getCurrentRevisionIDs: doc];
+                if (options->includeConflicts) {
+                    revIDs = [CBLForestBridge getCurrentRevisionIDs: doc includeDeleted: YES];
                 } else {
                     revIDs = @[(NSString*)doc.revID()];
                 }
@@ -466,7 +566,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
             }
         }
         return kCBLStatusOK;
-    }];
+    });
     return changes;
 }
 
@@ -557,7 +657,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 
             NSArray* conflicts = nil;
             if (options->allDocsMode >= kCBLShowConflicts && doc.isConflicted()) {
-                conflicts = [CBLForestBridge getCurrentRevisionIDs: doc];
+                conflicts = [CBLForestBridge getCurrentRevisionIDs: doc includeDeleted: NO];
                 if (conflicts.count == 1)
                     conflicts = nil;
             }
@@ -593,7 +693,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
     CBL_RevisionList* sortedRevs = [revs mutableCopy];
     [sortedRevs sortByDocID];
     __block VersionedDocument* doc = NULL;
-    *outStatus = [self _try: ^CBLStatus {
+    *outStatus = tryStatus(^CBLStatus {
         NSString* lastDocID = nil;
         for (CBL_Revision* rev in sortedRevs) {
             if (!$equal(rev.docID, lastDocID)) {
@@ -605,7 +705,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
                 [revs removeRevIdenticalTo: rev];
         }
         return kCBLStatusOK;
-    }];
+    });
     delete doc;
     return !CBLStatusIsError(*outStatus);
 }
@@ -616,7 +716,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 
 - (NSSet*) findAllAttachmentKeys: (NSError**)outError {
     NSMutableSet* keys = [NSMutableSet setWithCapacity: 1000];
-    CBLStatus status = [self _try: ^CBLStatus{
+    CBLStatus status = tryStatus(^CBLStatus{
         DocEnumerator::Options options = DocEnumerator::Options::kDefault;
         options.contentOptions = Database::kMetaOnly;
         for (DocEnumerator e(*_forest, slice::null, slice::null, options); e.next(); ) {
@@ -645,7 +745,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
             }
         }
         return kCBLStatusOK;
-    }];
+    });
     if (CBLStatusIsError(status)) {
         CBLStatusToOutNSError(status, outError);
         keys = nil;
@@ -822,11 +922,11 @@ static NSDictionary* getDocProperties(const Document& doc) {
 - (NSString*) infoForKey: (NSString*)key {
     KeyStore infoStore(_forest, "info");
     __block NSString* value = nil;
-    [self _try: ^CBLStatus {
+    tryStatus(^CBLStatus {
         Document doc = infoStore.get((forestdb::slice)key.UTF8String);
         value = (NSString*)doc.body();
         return kCBLStatusOK;
-    }];
+    });
     return value;
 }
 
@@ -842,18 +942,6 @@ static NSDictionary* getDocProperties(const Document& doc) {
 
 
 #pragma mark - INSERTION:
-
-
-static void convertRevIDs(NSArray* revIDs,
-                          std::vector<revidBuffer> &historyBuffers,
-                          std::vector<revid> &historyVector)
-{
-    historyBuffers.resize(revIDs.count);
-    for (NSString* revID in revIDs) {
-        historyBuffers.push_back(revidBuffer(revID));
-        historyVector.push_back(historyBuffers.back());
-    }
-}
 
 
 - (CBLDatabaseChange*) changeWithNewRevision: (CBL_Revision*)inRev
@@ -1046,9 +1134,10 @@ static void convertRevIDs(NSArray* revIDs,
         VersionedDocument doc(*_forest, inRev.docID);
 
         // Add the revision & ancestry to the doc:
-        std::vector<revidBuffer> historyBuffers;
-        std::vector<revid> historyVector;
-        convertRevIDs(history, historyBuffers, historyVector);
+        std::vector<revidBuffer> historyVector;
+        historyVector.reserve(history.count);
+        for (NSString* revID in history)
+            historyVector.push_back(revidBuffer(revID));
         int common = doc.insertHistory(historyVector,
                                        forestdb::slice(json),
                                        inRev.deleted,
@@ -1122,16 +1211,36 @@ static void convertRevIDs(NSArray* revIDs,
 
 
 - (id<CBL_ViewStorage>) viewStorageNamed: (NSString*)name create:(BOOL)create {
-    return [[CBL_ForestDBViewStorage alloc] initWithDBStorage: self name: name create: create];
+    id<CBL_ViewStorage> view = [_views objectForKey: name];
+    if (!view) {
+        view = [[CBL_ForestDBViewStorage alloc] initWithDBStorage: self name: name create: create];
+        if (view) {
+            if (!_views)
+                _views = [NSMapTable strongToWeakObjectsMapTable];
+            [_views setObject: view forKey: name];
+        }
+    }
+    return view;
+}
+
+
+- (void) forgetViewStorageNamed: (NSString*)viewName {
+    [_views removeObjectForKey: viewName];
 }
 
 
 - (NSArray*) allViewNames {
     NSArray* filenames = [[NSFileManager defaultManager] contentsOfDirectoryAtPath: _directory
                                                                              error: NULL];
-    return [filenames my_map: ^id(NSString* filename) {
-        return [CBL_ForestDBViewStorage fileNameToViewName: filename];
-    }];
+    // Mapping files->views may produce duplicates because there can be multiple files for the
+    // same view, if compression is in progress. So use a set to coalesce them.
+    NSMutableSet *viewNames = [NSMutableSet set];
+    for (NSString* filename in filenames) {
+        NSString* viewName = [CBL_ForestDBViewStorage fileNameToViewName: filename];
+        if (viewName)
+            [viewNames addObject: viewName];
+    }
+    return viewNames.allObjects;
 }
 
 

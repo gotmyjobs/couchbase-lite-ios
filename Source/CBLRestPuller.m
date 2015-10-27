@@ -26,11 +26,14 @@
 #import "CBLBatcher.h"
 #import "CBLMultipartDownloader.h"
 #import "CBLBulkDownloader.h"
+#import "CBLAttachmentDownloader.h"
 #import "CBLCookieStorage.h"
 #import "CBLSequenceMap.h"
 #import "CBLInternal.h"
 #import "CBLMisc.h"
 #import "CBLJSON.h"
+#import "CBLProgressGroup.h"
+#import "CBL_AttachmentTask.h"
 #import "ExceptionUtils.h"
 #import "MYURLUtils.h"
 
@@ -40,8 +43,8 @@
 // run out, even if the CBL thread doesn't always have time to run.)
 #define kMaxOpenHTTPConnections 12
 
-// Maximum number of revs to fetch in a single bulk request
-#define kMaxRevsToGetInBulk 50u
+// Maximum number of revs to fetch in a single _all_docs request (CouchDB only, not SG)
+#define kMaxRevsToGetInBulkWithAllDocs 50u
 
 // Maximum number of revs we want to be handling at once -- that's all revs that we've heard about
 // from the change tracker but haven't yet inserted into the database. Once we hit this limit we
@@ -50,12 +53,12 @@
 // above this limit.
 #define kMaxPendingDocs 200u
 
+// Delay time of the CBLBatcher that stores revisions to be inserted into the database.
+#define kInsertionBatcherDelay 0.25
+
 
 @interface CBLRestPuller () <CBLChangeTrackerClient>
 @end
-
-
-static NSString* joinQuotedEscaped(NSArray* strings);
 
 
 @implementation CBLRestPuller
@@ -70,7 +73,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     if (!_downloadsToInsert) {
         // Note: This is a ref cycle, because the block has a (retained) reference to 'self',
         // and _downloadsToInsert retains the block, and of course I retain _downloadsToInsert.
-        _downloadsToInsert = [[CBLBatcher alloc] initWithCapacity: 200 delay: 1.0
+        _downloadsToInsert = [[CBLBatcher alloc] initWithCapacity: 200 delay: kInsertionBatcherDelay
                                                   processor: ^(NSArray *downloads) {
                                                       [self insertDownloads: downloads];
                                                   }];
@@ -88,6 +91,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     _caughtUp = NO;
     [self asyncTaskStarted];   // task: waiting to catch up
     [self startChangeTracker];
+    [self downloadWaitingAttachments];
 }
 
 
@@ -103,7 +107,6 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                                                          conflicts: YES
                                                       lastSequence: _lastSequence
                                                             client: self];
-    // Limit the number of changes to return, so we can parse the feed in parts:
     _changeTracker.continuous = _settings.continuous;
     _changeTracker.filterName = _settings.filterName;
     _changeTracker.filterParameters = _settings.filterParameters;
@@ -181,8 +184,10 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // If we were already online (i.e. server is reachable) but got a reachability-change event,
     // tell the tracker to retry in case it's in retry mode after a transient failure. (I.e. the
     // state of the network might be better now.)
-    if (_running && _online)
+    if (_running && _online) {
         [_changeTracker retry];
+        [self downloadWaitingAttachments];
+    }
     return NO;
 }
 
@@ -206,6 +211,14 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                                  port: (UInt16)port
 {
     return [self checkSSLServerTrust: serverTrust forHost: host port: port];
+}
+
+
+- (void) changeTrackerReceivedHTTPHeaders:(NSDictionary *)headers {
+    if (!_serverType) {
+        _serverType = headers[@"Server"];
+        LogTo(Sync, @"%@: Server is %@", self, _serverType);
+    }
 }
 
 
@@ -285,6 +298,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         _canBulkGet = [self serverIsSyncGatewayVersion: @"0.81"];
 
     // Ask the local database which of the revs are not known to it:
+    LogTo(SyncPerf, @"%@: Processing %u changes", self, (unsigned)inbox.count);
     LogTo(SyncVerbose, @"%@: Looking up %@", self, inbox);
     id lastInboxSequence = [inbox.allRevisions.lastObject remoteSequenceID];
     NSUInteger originalCount = inbox.count;
@@ -311,6 +325,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         return;
     }
     
+    LogTo(SyncPerf, @"%@: Queuing download requests for %u revisions", self, (unsigned)inbox.count);
     LogTo(SyncVerbose, @"%@ queuing remote revisions %@", self, inbox.allRevisions);
     
     // Dump the revs into the queues of revs to pull from the remote db:
@@ -358,7 +373,9 @@ static NSString* joinQuotedEscaped(NSArray* strings);
 // Start up some HTTP GETs, within our limit on the maximum simultaneous number
 - (void) pullRemoteRevisions {
     while (_db && _httpConnectionCount < kMaxOpenHTTPConnections) {
-        NSUInteger nBulk = MIN(_bulkRevsToPull.count, kMaxRevsToGetInBulk);
+        NSUInteger nBulk = _bulkRevsToPull.count;
+        if (!_canBulkGet)
+            nBulk = MIN(nBulk, kMaxRevsToGetInBulkWithAllDocs);
         if (nBulk == 1) {
             // Rather than pulling a single revision in 'bulk', just pull it normally:
             [self queueRemoteRevision: _bulkRevsToPull[0]];
@@ -395,36 +412,48 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // Construct a query. We want the revision history, and the bodies of attachments.
     // See: http://wiki.apache.org/couchdb/HTTP_Document_API#GET
     // See: http://wiki.apache.org/couchdb/HTTP_Document_API#Getting_Attachments_With_a_Document
-    NSString* path = $sprintf(@"%@?rev=%@&revs=true&attachments=true",
+    NSString* path = $sprintf(@"%@?rev=%@&revs=true",
                               CBLEscapeURLParam(rev.docID), CBLEscapeURLParam(rev.revID));
-    // If the document has attachments, add an 'atts_since' param with a list of
-    // already-known revisions, so the server can skip sending the bodies of any
-    // attachments we already have locally:
     CBLDatabase* db = _db;
-    NSArray* knownRevs = [db.storage getPossibleAncestorRevisionIDs: rev
-                                                              limit: kMaxNumberOfAttsSince
-                                                    onlyAttachments: YES];
-    if (knownRevs.count > 0)
-        path = [path stringByAppendingFormat: @"&atts_since=%@", joinQuotedEscaped(knownRevs)];
+    if (_settings.downloadAttachments) {
+        // If the document has attachments, add an 'atts_since' param with a list of
+        // already-known revisions, so the server can skip sending the bodies of any
+        // attachments we already have locally:
+        NSArray* knownRevs = [db.storage getPossibleAncestorRevisionIDs: rev
+                                                                  limit: kMaxNumberOfAttsSince
+                                                        onlyAttachments: YES];
+        if (knownRevs.count > 0)
+            path = [path stringByAppendingFormat: @"&attachments=true&atts_since=%@",
+                                joinQuotedEscaped(knownRevs)];
+        else
+            path = [path stringByAppendingString: @"&attachments=true"];
+    }
+    LogTo(SyncPerf, @"%@: Getting %@", self, rev);
     LogTo(SyncVerbose, @"%@: GET %@", self, path);
     
-    // Under ARC, using variable dl directly in the block given as an argument to initWithURL:...
-    // results in compiler error (could be undefined variable)
     __weak CBLRestPuller *weakSelf = self;
     __block CBLMultipartDownloader *dl;
     dl = [[CBLMultipartDownloader alloc] initWithURL: CBLAppendToURL(_settings.remote, path)
-                                           database: db
-                                     requestHeaders: _settings.requestHeaders
-                                       onCompletion:
+                                            database: db
+                                      requestHeaders: _settings.requestHeaders
+                                        onCompletion:
         ^(CBLMultipartDownloader* result, NSError *error) {
             __strong CBLRestPuller *strongSelf = weakSelf;
-            // OK, now we've got the response revision:
+            // OK, now we've got the response:
+            LogTo(SyncPerf, @"%@: Got %@", strongSelf, rev);
             if (error) {
-                [strongSelf revision: rev failedWithError: error];
+                if (isDocumentError(error)) {
+                    // Revision is missing or not accessible:
+                    [strongSelf revision: rev failedWithError: error];
+                } else {
+                    // Request failed:
+                    strongSelf.error = error;
+                    [strongSelf revisionFailed];
+                }
             } else {
+                // Add to batcher ... eventually it will be fed to -insertRevisions:.
                 CBL_Revision* gotRev = [CBL_Revision revisionWithProperties: result.document];
                 gotRev.sequence = rev.sequence;
-                // Add to batcher ... eventually it will be fed to -insertRevisions:.
                 [strongSelf queueDownloadedRevision:gotRev];
             }
             
@@ -455,20 +484,29 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         return;
     }
 
+    LogTo(SyncPerf, @"%@: bulk-getting %u remote revisions...", self, (unsigned)nRevs);
     LogTo(SyncVerbose, @"%@: POST _bulk_get", self);
     NSMutableArray* remainingRevs = [bulkRevs mutableCopy];
     [self asyncTaskStarted];
     ++_httpConnectionCount;
     __weak CBLRestPuller *weakSelf = self;
     __block CBLBulkDownloader *dl;
+    __block BOOL first = YES;
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
     dl = [[CBLBulkDownloader alloc] initWithDbURL: _settings.remote
                                          database: _db
                                    requestHeaders: _settings.requestHeaders
                                         revisions: bulkRevs
+                                      attachments: _settings.downloadAttachments
                                        onDocument:
           ^(NSDictionary* props) {
               // Got a revision!
               __strong CBLRestPuller *strongSelf = weakSelf;
+              if (first) {
+                  first = NO;
+                  LogTo(SyncPerf, @"%@: Received first revision from bulk-get (%.3f sec)",
+                        self, CFAbsoluteTimeGetCurrent()-start);
+              }
               // Find the matching revision in 'remainingRevs' and get its sequence:
               CBL_Revision* rev;
               if (props.cbl_id)
@@ -496,6 +534,8 @@ static NSString* joinQuotedEscaped(NSArray* strings);
           ^(CBLBulkDownloader* result, NSError *error) {
               // The entire _bulk_get is finished:
               __strong CBLRestPuller *strongSelf = weakSelf;
+              LogTo(SyncPerf, @"%@: finished bulk-getting %u remote revisions (%.3f sec)",
+                    self, (unsigned)nRevs, CFAbsoluteTimeGetCurrent()-start);
 
               // Remove the remote request first to prevent the request from cancellation
               // when setting the error (a permanent error). If that happens, this block
@@ -533,6 +573,8 @@ static NSString* joinQuotedEscaped(NSArray* strings);
 // This is compatible with CouchDB, but it only works for revs of generation 1 without attachments.
 - (void) pullBulkWithAllDocs: (NSArray*)bulkRevs {
     // http://wiki.apache.org/couchdb/HTTP_Bulk_Document_API
+    LogTo(SyncPerf, @"%@: Using _all_docs to get %u remote revisions...",
+          self, (unsigned)bulkRevs.count);
     [self asyncTaskStarted];
     ++_httpConnectionCount;
     CBL_RevisionList* remainingRevs = [[CBL_RevisionList alloc] initWithArray: bulkRevs];
@@ -549,6 +591,8 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                       // We only add a document if it doesn't have attachments, and if its
                       // revID matches the one we asked for.
                       NSArray* rows = $castIf(NSArray, result[@"rows"]);
+                      LogTo(SyncPerf, @"%@: Got %u remote revisions with _all_docs",
+                            self, (unsigned)rows.count);
                       LogTo(Sync, @"%@ checking %u bulk-fetched remote revisions",
                             self, (unsigned)rows.count);
                       for (NSDictionary* row in rows) {
@@ -635,13 +679,13 @@ static NSString* joinQuotedEscaped(NSArray* strings);
             [attachment removeObjectForKey: @"file"];
         }];
     }
-    [rev.body compact];
     [self asyncTaskStarted];
     [_downloadsToInsert queueObject: rev];
 }
 
 // This will be called when _downloadsToInsert fills up:
 - (void) insertDownloads:(NSArray *)downloads {
+    LogTo(SyncPerf, @"%@: inserting %u revisions into db...", self, (unsigned)downloads.count);
     LogTo(SyncVerbose, @"%@ inserting %u revisions...", self, (unsigned)downloads.count);
     CFAbsoluteTime time = CFAbsoluteTimeGetCurrent();
         
@@ -695,12 +739,102 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     self.lastSequence = _pendingSequences.checkpointedValue;
 
     time = CFAbsoluteTimeGetCurrent() - time;
+    LogTo(SyncPerf, @"%@: inserted %u revs in %.3f sec (%.1f/sec)",
+          self, (unsigned)downloads.count, time, downloads.count/time);
     LogTo(Sync, @"%@ inserted %u revs in %.3f sec (%.1f/sec)",
           self, (unsigned)downloads.count, time, downloads.count/time);
     
     [self asyncTasksFinished: downloads.count];
     self.changesProcessed += downloads.count;
     [self pauseOrResume];
+}
+
+
+#pragma mark - DOWNLOADING ATTACHMENTS:
+
+
+// Start downloading if online, else add to _waitingAttachments
+- (void) downloadAttachment: (CBL_AttachmentTask*)task {
+    __block CBLAttachmentDownloader* dl = _attachmentDownloads[task.ID];
+    if (dl) {
+        // Already being downloaded, so just transfer task's progress object(s) to existing dl:
+        [dl addTask: task];
+    } else if (!_running || !_online) {
+        // Replicator isn't online, so remember it for later:
+        [self addToWaitingAttachments: task];
+    } else {
+        // Not being downloaded, so create a downloader:
+        __weak CBLRestPuller *weakSelf = self;
+        dl = [[CBLAttachmentDownloader alloc] initWithDbURL: _settings.remote
+                                                   database: _db
+                                                 attachment: task
+                                               onCompletion:
+              ^(id result, NSError *error) {
+                  // On completion or error:
+                  __strong CBLRestPuller *strongSelf = weakSelf;
+                  [strongSelf->_attachmentDownloads removeObjectForKey: task.ID];
+                  if (error) {
+                      if (_running && !_online) {
+                          // I've gone offline, so save the tasks for later:
+                          [task.progress setIndeterminate];
+                          [self addToWaitingAttachments: task];
+                      } else {
+                          // Otherwise give up:
+                          [task.progress failedWithError: error];
+                      }
+                  }
+                  [strongSelf removeRemoteRequest: dl];
+                  [strongSelf asyncTasksFinished: 1];
+              }];
+        if (!dl)
+            return; // already been downloaded
+
+        // Remember the downloader, then start it:
+        if (!_attachmentDownloads)
+            _attachmentDownloads = [NSMutableDictionary new];
+        _attachmentDownloads[task.ID] = dl;
+
+        [self asyncTaskStarted];
+        [self addRemoteRequest: dl];
+        [dl start];
+    }
+}
+
+- (void) addToWaitingAttachments: (CBL_AttachmentTask*)task {
+    if (!_waitingAttachments)
+        _waitingAttachments = [NSMutableArray new];
+    [_waitingAttachments addObject: task];
+}
+
+// Start all attachment requests in _waitingAttachments
+- (void) downloadWaitingAttachments {
+    if (_running && _online) {
+        NSArray* waiting = _waitingAttachments;
+        _waitingAttachments = nil;
+        for (CBL_AttachmentTask* attachment in waiting)
+            [self downloadAttachment: attachment];
+    }
+}
+
+
+#pragma mark - UTILITY FUNCTIONS:
+
+
+static NSString* joinQuotedEscaped(NSArray* strings) {
+    if (strings.count == 0)
+        return @"[]";
+    NSString* json = [CBLJSON stringWithJSONObject: strings options: 0 error: NULL];
+    return CBLEscapeURLParam(json);
+}
+
+
+// Returns YES if an error refers to an inaccessible document, not the request itself,
+// and shouldn't cause the replication to stop.
+static BOOL isDocumentError(NSError* error) {
+    if (![error.domain isEqualToString: CBLHTTPErrorDomain])
+        return NO;
+    NSInteger code = error.code;
+    return code == kCBLStatusNotFound || code == kCBLStatusForbidden || code == kCBLStatusGone;
 }
 
 
@@ -714,14 +848,5 @@ static NSString* joinQuotedEscaped(NSArray* strings);
 
 @synthesize remoteSequenceID=_remoteSequenceID, conflicted=_conflicted;
 
-
 @end
 
-
-
-static NSString* joinQuotedEscaped(NSArray* strings) {
-    if (strings.count == 0)
-        return @"[]";
-    NSString* json = [CBLJSON stringWithJSONObject: strings options: 0 error: NULL];
-    return CBLEscapeURLParam(json);
-}

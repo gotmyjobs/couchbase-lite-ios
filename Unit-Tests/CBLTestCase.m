@@ -11,8 +11,9 @@
 #import "CBLManager+Internal.h"
 #import "MYURLUtils.h"
 #import "CBLRemoteRequest.h"
-#import "CBL_BlobStore.h"
+#import "CBL_BlobStore+Internal.h"
 #import "CBLSymmetricKey.h"
+#import "CBLKVOProxy.h"
 
 
 // The default remote server URL used by RemoteTestDBURL().
@@ -70,6 +71,58 @@ extern NSString* WhyUnequalObjects(id a, id b); // from Test.m
     block();
     [CBLManager setWarningsRaiseExceptions: YES];
 }
+
+
+- (NSInteger) iOSVersion {
+#if TARGET_OS_IPHONE
+    if (![NSProcessInfo instancesRespondToSelector: @selector(operatingSystemVersion)])
+        return 7; // -operatingSystemVersion was added in iOS 8
+    return [NSProcessInfo processInfo].operatingSystemVersion.majorVersion;
+#else
+    return 0;
+#endif
+}
+
+- (NSInteger) macOSVersion {
+#if TARGET_OS_IPHONE
+    return 0;
+#else
+    if (![NSProcessInfo instancesRespondToSelector: @selector(operatingSystemVersion)])
+        return 9; // -operatingSystemVersion was added in OS X 10.10
+    return [NSProcessInfo processInfo].operatingSystemVersion.majorVersion;
+#endif
+}
+
+
+#if 1
+// NOTE: This is a workaround for XCTest's implementation of this method not being thread-safe.
+// We can take it out when our test bot is upgraded to Xcode 7 (beta 5 or later).
+- (XCTestExpectation *)keyValueObservingExpectationForObject:(id)objectToObserve
+                                                     keyPath:(NSString *)keyPath
+                                               expectedValue:(nullable id)expectedValue
+{
+    CBLKVOProxy* proxy = [[CBLKVOProxy alloc] initWithObject: objectToObserve
+                                                     keyPath: keyPath];
+    return [super keyValueObservingExpectationForObject: proxy
+                                                keyPath: keyPath
+                                          expectedValue: expectedValue];
+}
+
+- (XCTestExpectation *)keyValueObservingExpectationForObject:(id)objectToObserve
+                                                     keyPath:(NSString *)keyPath
+                                                     handler:(nullable XCKeyValueObservingExpectationHandler)handler
+{
+    XCKeyValueObservingExpectationHandler wrappedHandler = ^BOOL(id o, NSDictionary* c) {
+        return handler(objectToObserve, c);
+    };
+    CBLKVOProxy* proxy = [[CBLKVOProxy alloc] initWithObject: objectToObserve
+                                                     keyPath: keyPath];
+    return [super keyValueObservingExpectationForObject: proxy
+                                                keyPath: keyPath
+                                                handler: wrappedHandler];
+
+}
+#endif
 
 
 @end
@@ -144,10 +197,12 @@ extern NSString* WhyUnequalObjects(id a, id b); // from Test.m
 }
 
 - (void) setEncryptedAttachmentStore: (BOOL)encrypted {
-    if (!encrypted)
-        db.attachmentStore.encryptionKey = nil;
-    else if (db.attachmentStore.encryptionKey == nil)
-        db.attachmentStore.encryptionKey = [[CBLSymmetricKey alloc] init];
+    if (encrypted != self.encryptedAttachmentStore) {
+        CBLSymmetricKey* key = encrypted ? [[CBLSymmetricKey alloc] init] : nil;
+        NSError* error;
+        Assert([db.attachmentStore changeEncryptionKey: key error: &error],
+               @"Failed to add/remove encryption: %@", error);
+    }
 }
 
 
@@ -206,11 +261,23 @@ extern NSString* WhyUnequalObjects(id a, id b); // from Test.m
 
 
 - (NSURL*) remoteTestDBURL: (NSString*)dbName {
+    // If the OS has App Transport Security, we have to make all connections over SSL:
+    if (self.iOSVersion >= 9 || self.macOSVersion >= 11) {
+        NSArray* serverCerts = [self remoteTestDBAnchorCerts];
+        [CBLReplication setAnchorCerts: serverCerts onlyThese: NO];
+        return [self remoteSSLTestDBURL: dbName];
+    } else {
+        return [self remoteNonSSLTestDBURL: dbName];
+    }
+}
+
+
+- (NSURL*) remoteNonSSLTestDBURL: (NSString*)dbName {
     NSString* urlStr = [[NSProcessInfo processInfo] environment][@"CBL_TEST_SERVER"];
     if (!urlStr)
         urlStr = kDefaultRemoteTestServer;
     else if (urlStr.length == 0) {
-        Assert(NO, @"Skipping test: no remote DB SSL URL configured");
+        Assert(NO, @"Skipping test: no remote DB URL configured");
         return nil;
     }
     NSURL* server = [NSURL URLWithString: urlStr];
@@ -272,7 +339,7 @@ extern NSString* WhyUnequalObjects(id a, id b); // from Test.m
     
     // Post to /db/_flush is supported by Sync Gateway 1.1, but not by CouchDB
     NSURLComponents* comp = [NSURLComponents componentsWithURL: dbURL resolvingAgainstBaseURL: YES];
-    comp.port = @4985;
+    comp.port = ([dbURL.scheme isEqualToString: @"http"]) ? @4985 : @4995;
     comp.path = [comp.path stringByAppendingPathComponent: @"_flush"];
 
     CBLRemoteRequest* request = [[CBLRemoteRequest alloc] initWithMethod: @"POST"
@@ -286,6 +353,7 @@ extern NSString* WhyUnequalObjects(id a, id b); // from Test.m
                                  }
                                  ];
     request.authorizer = self.authorizer;
+    request.debugAlwaysTrust = YES;
     [request start];
     NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 10];
     while (!finished && [[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode

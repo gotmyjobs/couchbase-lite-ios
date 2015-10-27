@@ -7,7 +7,7 @@
 //
 
 #import "CBL_ReplicatorSettings.h"
-@class CBLDatabase, CBL_Revision, CBL_RevisionList, CBLCookieStorage;
+@class CBLDatabase, CBL_Revision, CBL_RevisionList, CBLCookieStorage, CBL_AttachmentTask;
 
 
 /** Describes the current status of a CBL_Replicator. */
@@ -19,11 +19,17 @@ typedef NS_ENUM(unsigned, CBL_ReplicatorStatus) {
 };
 
 
+typedef void (^CBL_ReplicatorAttachmentProgressBlock)(uint64_t bytesRead,
+                                                      uint64_t contentLength,
+                                                      NSError* error);
+
+
 /** Posted when .changesProcessed, .changesTotal or .status changes. */
 extern NSString* CBL_ReplicatorProgressChangedNotification;
 
 /** Posted when replicator stops running. */
 extern NSString* CBL_ReplicatorStoppedNotification;
+
 
 
 /** Protocol that replicator implementations must implement. */
@@ -77,15 +83,20 @@ extern NSString* CBL_ReplicatorStoppedNotification;
 /** Called by CBLDatabase to notify active replicators that it's about to close. */
 - (void) databaseClosing;
 
-#if DEBUG // for unit tests
+/** Current lastSequence tracked by the replicator. */
 @property (readonly) id lastSequence;
+
+#if DEBUG // for unit tests
 @property (readonly) BOOL active;
 @property (readonly) BOOL savingCheckpoint;
 #endif
 
 @optional
+/** The currently active tasks, each represented by an NSProgress object. (Observable) */
 @property (readonly) NSArray* activeTasksInfo;
-@property (readonly) NSSet* pendingDocIDs;
+
+/** Requests asynchronous download of the given attachment from the server. */
+- (void) downloadAttachment: (CBL_AttachmentTask*)attachment;
 
 @end
 

@@ -164,7 +164,8 @@
                                        {@"style", (_includeConflicts ? @"all_docs" : nil)},
                                        {@"since", since},
                                        {@"limit", (_limit > 0 ? @(_limit) : nil)},
-                                       {@"filter", filterName});
+                                       {@"filter", filterName},
+                                       {@"accept_encoding", @"gzip"});
     if (filterName && filterParameters)
         [post addEntriesFromDictionary: filterParameters];
     return [CBLJSON dataWithJSONObject: post options: 0 error: NULL];
@@ -266,6 +267,12 @@
             error = [NSError errorWithDomain: NSURLErrorDomain
                                         code: NSURLErrorCannotConnectToHost
                                     userInfo: error.userInfo];
+    } else if ($equal(domain, (id)kCFErrorDomainCFNetwork)) {
+        if (code == kCFHostErrorHostNotFound || code == kCFHostErrorUnknown) {
+            error = [NSError errorWithDomain: NSURLErrorDomain
+                                        code: NSURLErrorCannotFindHost
+                                    userInfo: error.userInfo];
+        }
     } else if ($equal(domain, NSURLErrorDomain)) {
         // Map a lower-level auth failure to an HTTP status:
         if (code == NSURLErrorUserAuthenticationRequired)
@@ -283,7 +290,7 @@
             self, _retryCount, retryDelay, error.localizedDescription);
         [self retryAfterDelay: retryDelay];
     } else {
-        Warn(@"%@: Can't connect, giving up: %@", self, error);
+        Log(@"%@: Can't connect, giving up: %@", self, error);
         self.error = error;
         [self stop];
     }
