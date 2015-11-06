@@ -17,7 +17,8 @@ typedef NS_ENUM(unsigned, CBLReplicationStatus) {
     kCBLReplicationStopped, /**< The replication is finished or hit a fatal error. */
     kCBLReplicationOffline, /**< The remote host is currently unreachable. */
     kCBLReplicationIdle,    /**< Continuous replication is caught up and waiting for more changes.*/
-    kCBLReplicationActive   /**< The replication is actively transferring data. */
+    kCBLReplicationActive,  /**< The replication is actively transferring data. */
+	kCBLReplicationInitiated
 } ;
 
 

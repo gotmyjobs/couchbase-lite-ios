@@ -279,7 +279,7 @@ NSString* CBL_ReplicatorStoppedNotification = @"CBL_ReplicatorStopped";
         }];
 
         // Initialize the status to something other than kCBLReplicationStopped:
-        [self updateStatus: kCBLReplicationOffline error: nil processed: 0 ofTotal: 0
+        [self updateStatus: kCBLReplicationInitiated error: nil processed: 0 ofTotal: 0
                 serverCert: NULL];
 
         [_database addReplication: self];
