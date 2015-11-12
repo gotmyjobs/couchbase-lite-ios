@@ -121,7 +121,6 @@
 
 - (void) setDocument:(CBLDocument *)document {
     NSAssert(!_document && document, @"Can't change or clear document");
-    NSAssert(document.modelObject == nil, @"Document already has a model");
     _document = document;
     _document.modelObject = self;
 }
