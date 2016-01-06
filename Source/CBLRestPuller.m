@@ -216,7 +216,7 @@
 
 - (void) changeTrackerReceivedHTTPHeaders:(NSDictionary *)headers {
     if (!_serverType) {
-        _serverType = headers[@"Server"];
+        _serverType = headers[@"X-Sync-Server"];
         LogTo(Sync, @"%@: Server is %@", self, _serverType);
     }
 }
