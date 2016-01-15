@@ -28,7 +28,7 @@ extern "C" {
 #import <CBForest/GeoIndex.hh>
 #import <CBForest/MapReduceDispatchIndexer.hh>
 #import <CBForest/Tokenizer.hh>
-using namespace forestdb;
+using namespace cbforest;
 #import "CBLForestBridge.h"
 using namespace couchbase_lite;
 
@@ -277,25 +277,12 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
         // likes to append ".0" etc., but there will be a file with a ".meta" extension:
         NSString* metaPath = [_path stringByAppendingPathExtension: @"meta"];
         if (![[NSFileManager defaultManager] fileExistsAtPath: metaPath isDirectory: NULL]) {
-            if (!create || ![self openIndexWithOptions: FDB_OPEN_FLAG_CREATE status: NULL])
+            if (!create || ![self openIndexWithCreate: YES status: NULL])
                 return nil;
         }
-
-    #if TARGET_OS_IPHONE
-        // On iOS, close the index when there's a low-memory notification:
-        [[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(closeIndex)
-                                                     name: UIApplicationDidReceiveMemoryWarningNotification object: nil];
-    #endif
     }
     return self;
 }
-
-
-#if TARGET_OS_IPHONE
-- (void) dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver: self];
-}
-#endif
 
 
 - (void) close {
@@ -333,24 +320,34 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
 #pragma mark - INDEX MANAGEMENT:
 
 
+- (Database::config) config {
+    auto config = Database::defaultConfig(); // +[CBL_ForestDBStorage initialize] sets defaults
+    config.seqtree_opt = FDB_SEQTREE_NOT_USE; // indexes don't need by-sequence ordering
+    if (!_dbStorage.autoCompact)
+        config.compaction_mode = FDB_COMPACTION_MANUAL;
+    if (_dbStorage.readOnly)
+        config.flags |= FDB_OPEN_FLAG_RDONLY;
+    return config;
+}
+
+
 // Opens the index. You MUST call this (or a method that calls it) before dereferencing _index.
 - (MapReduceIndex*) openIndex: (CBLStatus*)outStatus {
     if (_index)
         return _index;
-    return [self openIndexWithOptions: 0 status: outStatus];
+    return [self openIndexWithCreate: NO status: outStatus];
 }
 
 
-// Opens the index, specifying ForestDB database flags
-- (MapReduceIndex*) openIndexWithOptions: (fdb_open_flags)options
-                                  status: (CBLStatus*)outStatus
+// Opens the index, optionally creating it
+- (MapReduceIndex*) openIndexWithCreate: (BOOL)create
+                                 status: (CBLStatus*)outStatus
 {
     if (!_index) {
         Assert(!_indexDB);
-        auto config = Database::defaultConfig(); // +[CBL_ForestDBStorage initialize] sets defaults
-        config.flags = options;
-        config.seqtree_opt = FDB_SEQTREE_NOT_USE; // indexes don't need by-sequence ordering
-        config.compaction_mode = FDB_COMPACTION_AUTO;
+        auto config = self.config;
+        if (create && !(config.flags & FDB_OPEN_FLAG_RDONLY))
+            config.flags |= FDB_OPEN_FLAG_CREATE;
 
         NSError* error;
         _indexDB = [CBLForestBridge openDatabaseAtPath: _path
@@ -402,6 +399,7 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
 }
 
 
+// This doesn't delete the index database, just erases it
 - (void) deleteIndex {
     if ([self openIndex: NULL]) {
         Transaction t(_indexDB);
@@ -410,10 +408,20 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
 }
 
 
-- (void) deleteView {
+// Deletes the index without notifying the main storage that the view is gone
+- (BOOL) deleteViewFiles: (NSError**)outError {
     [self closeIndex];
+    return tryError(outError, ^{
+        std::string pathStr(_path.fileSystemRepresentation);
+        auto config = self.config;
+        Database::deleteDatabase(pathStr, config);
+    });
+}
+
+// Main Storage-protocol method to delete a view
+- (void) deleteView {
     if (!_dbStorage.readOnly) {
-        [[NSFileManager defaultManager] removeItemAtPath: _path error: NULL];
+        [self deleteViewFiles: NULL];
         [_dbStorage forgetViewStorageNamed: _name];
     }
 }
@@ -423,12 +431,11 @@ static inline NSString* viewNameToFileName(NSString* viewName) {
     MYAction* action = [MYAction new];
     [action addPerform:^BOOL(NSError **outError) {
         // Close and delete the index database:
-        [self closeIndex];
-        return [[NSFileManager defaultManager] removeItemAtPath: _path error: outError];
+        return [self deleteViewFiles: outError];
     } backOutOrCleanUp:^BOOL(NSError **outError) {
         // Afterwards, reopen (and re-create) the index:
         CBLStatus status;
-        if (![self openIndexWithOptions: FDB_OPEN_FLAG_CREATE status: &status])
+        if (![self openIndexWithCreate: YES status: &status])
             return CBLStatusToOutNSError(status, outError);
         [self closeIndex];
         return YES;
@@ -677,7 +684,7 @@ static id parseJSONSlice(slice s) {
                 // Got a row to return!
                 return row;
             }
-        } catch (forestdb::error x) {
+        } catch (cbforest::error x) {
             Warn(@"Unexpected ForestDB error iterating query (status %d)", x.status);
         } catch (NSException* x) {
             MYReportException(x, @"CBL_ForestDBViewStorage");
@@ -766,7 +773,7 @@ static id parseJSONSlice(slice s) {
                 lastKey = key;
             } while (!row && lastKey);
             return row;
-        } catch (forestdb::error x) {
+        } catch (cbforest::error x) {
             Warn(@"Unexpected ForestDB error iterating query (status %d)", x.status);
         } catch (NSException* x) {
             MYReportException(x, @"CBL_ForestDBViewStorage");
